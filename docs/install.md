@@ -111,6 +111,11 @@ pausing requests. Routine updates retain `/etc/op-bridge.json`, the sudo rule, a
 all history. If changing policy, validate the whole replacement and its generated
 sudo rule first. Do not run two versions of the helper concurrently.
 
+When changing the permitted caller, replace the sudo rule in the same paused
+window. When switching to owner-only or client-only use, remove the old
+`/etc/sudoers.d/op-bridge` rule. Editing configuration alone does not revoke an
+existing sudo grant to run the bridge as the desktop owner.
+
 1. Pause callers. Let active requests finish and resolve uncertain writes.
 2. On each approval desktop being updated, stop its **local** session with the
    appropriate `--desktop NAME session stop`. Its outgoing default may be remote.
