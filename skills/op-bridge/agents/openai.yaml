@@ -1,0 +1,4 @@
+interface:
+  display_name: "op-bridge"
+  short_description: "Use a configured desktop to read or store 1Password secrets"
+  default_prompt: "Use $op-bridge to read or store the credential this task requires. Keep values out of task output."

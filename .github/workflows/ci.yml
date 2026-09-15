@@ -1,0 +1,20 @@
+name: test
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Install test prerequisites
+        run: sudo apt-get update && sudo apt-get install -y dbus sudo
+      - name: Formatting
+        run: test -z "$(gofmt -l cmd internal)"
+      - run: go test ./...
+      - run: go test -race ./...
+      - run: go vet ./...
+      - run: bin/check-package

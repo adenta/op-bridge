@@ -1,0 +1,8 @@
+{
+  "version": 3,
+  "machine": "build-server",
+  "default_desktop": "laptop",
+  "desktops": {
+    "laptop": {"transport": "ssh", "ssh_host": "laptop", "owner": "alice", "account": "my.1password.com"}
+  }
+}

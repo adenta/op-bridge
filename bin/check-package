@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+set -euo pipefail
+repo=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+cd "$repo"
+for tool in go tar sha256sum visudo; do
+  command -v "$tool" >/dev/null || { echo "Required package-check tool missing: $tool" >&2; exit 1; }
+done
+case "$(go env GOHOSTOS)/$(go env GOHOSTARCH)" in linux/amd64|linux/arm64) ;; *) echo 'Run package checks on supported Linux hardware' >&2; exit 1 ;; esac
+archive=$(GOARCH="$(go env GOHOSTARCH)" bin/build-release check)
+stage=$(mktemp -d)
+trap 'rm -rf -- "$stage"; rm -f -- "$archive" "$archive.sha256"' EXIT
+(cd dist && sha256sum -c "$(basename "$archive").sha256")
+tar -xzf "$archive" -C "$stage"
+bundle="$stage/op-bridge-check-linux-$(go env GOHOSTARCH)"
+for file in op-bridge README.md LICENSE SECURITY.md ORIGIN.md docs/install.md docs/configuration.md docs/usage.md docs/migration.md deploy/desktop.json deploy/client.json deploy/owner-only.json skills/op-bridge/SKILL.md skills/op-bridge/agents/openai.yaml; do
+  test -f "$bundle/$file" || { echo "Missing release file: $file" >&2; exit 1; }
+done
+test "$("$bundle/op-bridge" --version)" = 'op-bridge check'
+"$bundle/op-bridge" --help >/dev/null
+for example in "$bundle"/deploy/*.json; do "$bundle/op-bridge" config check "$example"; done
+"$bundle/op-bridge" config sudoers "$bundle/deploy/desktop.json" > "$stage/op-bridge.sudoers"
+visudo -cf "$stage/op-bridge.sudoers"
+if "$bundle/op-bridge" config sudoers "$bundle/deploy/client.json" >/dev/null 2>&1; then
+  echo 'Client-only package unexpectedly grants sudo' >&2; exit 1
+fi
+if "$bundle/op-bridge" config sudoers "$bundle/deploy/owner-only.json" >/dev/null 2>&1; then
+  echo 'Owner-only package unexpectedly grants sudo' >&2; exit 1
+fi
+printf '%s\n' 'Package checks passed; no live files or services changed.'

@@ -1,0 +1,14 @@
+{
+  "version": 3,
+  "machine": "laptop",
+  "local_bridge": {
+    "owner": "alice",
+    "caller": "automation",
+    "account": "my.1password.com"
+  },
+  "default_desktop": "laptop",
+  "desktops": {
+    "laptop": {"transport": "local", "account": "my.1password.com"},
+    "office": {"transport": "ssh", "ssh_host": "office-desktop", "owner": "bob", "account": "example.1password.com"}
+  }
+}

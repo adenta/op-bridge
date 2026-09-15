@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+set -euo pipefail
+repo=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+cd "$repo"
+version=${1:-dev}
+if [[ ! "$version" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+  echo 'usage: bin/build-release [VERSION]' >&2
+  exit 1
+fi
+arch=${GOARCH:-$(go env GOARCH)}
+case "$arch" in amd64|arm64) ;; *) echo 'Supported release targets: linux/amd64 and linux/arm64' >&2; exit 1 ;; esac
+name="op-bridge-$version-linux-$arch"
+mkdir -p dist
+stage=$(mktemp -d "$repo/dist/.stage.XXXXXXXX")
+trap 'rm -rf -- "$stage"' EXIT
+mkdir "$stage/$name"
+CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build -trimpath -buildvcs=false \
+  -ldflags "-s -w -X github.com/adenta/op-bridge/internal/secrets.Version=$version" \
+  -o "$stage/$name/op-bridge" ./cmd/op-bridge
+cp README.md LICENSE SECURITY.md ORIGIN.md "$stage/$name/"
+cp -R docs deploy skills "$stage/$name/"
+tar -C "$stage" -czf "$stage/$name.tar.gz" "$name"
+mv "$stage/$name.tar.gz" "dist/$name.tar.gz"
+(cd dist && sha256sum "$name.tar.gz" > "$name.tar.gz.sha256")
+printf '%s\n' "$repo/dist/$name.tar.gz"
