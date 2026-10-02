@@ -96,10 +96,9 @@ func TestClientCarriesAccountAndDesktopRejectsMismatch(t *testing.T) {
 	}
 }
 
-func TestDesktopRejectsAccountBeforeNotification(t *testing.T) {
+func TestDesktopRejectsAccountBeforeDispatch(t *testing.T) {
 	w := testWorker(t, "echo should-not-run\n")
 	p := testSessionPolicy(w, workerLifetime)
-	p.notify = func(context.Context, Request) error { t.Error("invalid account notified"); return nil }
 	socket := testSession(t, p)
 	r := writeRequest()
 	r.Args = append(r.Args, "--account=other.1password.com")

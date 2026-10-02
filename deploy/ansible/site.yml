@@ -1,0 +1,868 @@
+---
+- name: Deploy op-bridge
+  hosts: op_bridge
+  gather_facts: true
+  become: true
+  serial: 1
+  any_errors_fatal: true
+
+  vars:
+    op_bridge_artifact_name: "op-bridge-{{ op_bridge_version }}-{{ op_bridge_artifact_os }}-{{ op_bridge_artifact_arch }}"
+    op_bridge_artifact_file: "{{ op_bridge_artifact_name }}.tar.gz"
+    op_bridge_controller_artifact: "{{ playbook_dir }}/../../dist/{{ op_bridge_artifact_file }}"
+    op_bridge_controller_checksum: "{{ op_bridge_controller_artifact }}.sha256"
+    op_bridge_stage_root: "/var/tmp/.op-bridge-stage-{{ op_bridge_version }}-{{ op_bridge_artifact_os }}-{{ op_bridge_artifact_arch }}"
+    op_bridge_stage_archive: "{{ op_bridge_stage_root }}/{{ op_bridge_artifact_file }}"
+    op_bridge_stage_bundle: "{{ op_bridge_stage_root }}/{{ op_bridge_artifact_name }}"
+    op_bridge_stage_config: "{{ op_bridge_stage_root }}/op-bridge.json"
+    op_bridge_stage_sudoers: "{{ op_bridge_stage_root }}/op-bridge.sudoers"
+    op_bridge_recovery_root: "/var/tmp/.op-bridge-recovery-{{ op_bridge_version }}"
+    op_bridge_binary: /usr/local/libexec/op-bridge/op-bridge
+    op_bridge_terminal_launcher: /usr/local/libexec/op-bridge/Launch.command
+    op_bridge_link: /usr/local/bin/op-bridge
+    op_bridge_config_path: /etc/op-bridge.json
+    op_bridge_sudoers: /etc/sudoers.d/op-bridge
+    op_bridge_launch_agent_label: com.adenta.op-bridge.session
+    op_bridge_launch_agent_path: "{{ op_bridge_owner_home | default('/Users/' + (op_bridge_owner | default(''))) }}/Library/LaunchAgents/com.adenta.op-bridge.session.plist"
+    op_bridge_has_sudo_rule: "{{ op_bridge_config.local_bridge is defined and (op_bridge_config.local_bridge.caller | default('') | length > 0) }}"
+    op_bridge_activation_started: false
+    op_bridge_current_binary: {stat: {exists: false}}
+    op_bridge_current_link: {stat: {exists: false}}
+    op_bridge_current_config: {stat: {exists: false}}
+    op_bridge_current_sudoers: {stat: {exists: false}}
+    op_bridge_current_launch_agent: {stat: {exists: false}}
+    op_bridge_current_terminal_launcher: {stat: {exists: false}}
+    op_bridge_current_skill_files: {results: []}
+    op_bridge_old_launch_agent_registration: {rc: 1}
+
+  pre_tasks:
+    - name: Confirm the SSH login account
+      ansible.builtin.command: /usr/bin/id -un
+      become: false
+      check_mode: false
+      changed_when: false
+      register: op_bridge_login
+
+    - name: Read the target hostname
+      ansible.builtin.command: /bin/hostname
+      become: false
+      check_mode: false
+      changed_when: false
+      register: op_bridge_hostname
+
+    - name: Refuse an unexpected target
+      ansible.builtin.assert:
+        that:
+          - op_bridge_login.stdout == op_bridge_expected_user
+          - op_bridge_hostname.stdout == op_bridge_expected_hostname
+          - ansible_facts.system == op_bridge_expected_system
+          - ansible_facts.architecture == op_bridge_expected_architecture
+        fail_msg: >-
+          Target identity does not match inventory: user={{ op_bridge_login.stdout }},
+          host={{ op_bridge_hostname.stdout }}, system={{ ansible_facts.system }},
+          architecture={{ ansible_facts.architecture }}.
+
+    - name: Locate the controller release artifact
+      ansible.builtin.stat:
+        path: "{{ op_bridge_controller_artifact }}"
+        checksum_algorithm: sha256
+      delegate_to: localhost
+      become: false
+      register: op_bridge_controller_artifact_stat
+
+    - name: Read the controller checksum file
+      ansible.builtin.slurp:
+        src: "{{ op_bridge_controller_checksum }}"
+      delegate_to: localhost
+      become: false
+      register: op_bridge_checksum_file
+
+    - name: Record the expected release checksum
+      ansible.builtin.set_fact:
+        op_bridge_release_checksum: "{{ (op_bridge_checksum_file.content | b64decode).split()[0] }}"
+
+    - name: Verify the controller release artifact
+      ansible.builtin.assert:
+        that:
+          - op_bridge_controller_artifact_stat.stat.exists
+          - op_bridge_controller_artifact_stat.stat.isreg
+          - op_bridge_release_checksum | length == 64
+          - op_bridge_controller_artifact_stat.stat.checksum == op_bridge_release_checksum
+        fail_msg: Build and checksum the requested release before running Ansible.
+
+    - name: Inspect any unfinished recovery directory
+      ansible.builtin.stat:
+        path: "{{ op_bridge_recovery_root }}"
+      register: op_bridge_existing_recovery
+
+    - name: Refuse to overwrite unfinished recovery data
+      ansible.builtin.assert:
+        that: not op_bridge_existing_recovery.stat.exists
+        fail_msg: >-
+          Recovery data already exists at {{ op_bridge_recovery_root }}. Inspect and
+          finish that recovery before deploying this version again.
+
+  tasks:
+    - name: Preview the rendered configuration
+      ansible.builtin.template:
+        src: templates/op-bridge.json.j2
+        dest: "{{ op_bridge_config_path }}"
+        owner: root
+        group: "{{ op_bridge_root_group }}"
+        mode: "0644"
+      when: ansible_check_mode
+
+    - name: Preview the macOS Terminal launcher
+      ansible.builtin.copy:
+        src: ../macos/Launch.command
+        dest: "{{ op_bridge_terminal_launcher }}"
+        owner: root
+        group: "{{ op_bridge_root_group }}"
+        mode: "0755"
+      when: ansible_check_mode and op_bridge_launch_agent | bool
+
+    - name: Preview the macOS LaunchAgent
+      ansible.builtin.copy:
+        src: ../macos/com.adenta.op-bridge.session.plist
+        dest: "{{ op_bridge_launch_agent_path }}"
+        owner: "{{ op_bridge_owner }}"
+        group: "{{ op_bridge_owner_group }}"
+        mode: "0644"
+      when: ansible_check_mode and op_bridge_launch_agent | bool
+
+    - name: Preview the managed skill directory
+      ansible.builtin.file:
+        path: "{{ op_bridge_skill_root }}/agents"
+        state: directory
+        owner: "{{ op_bridge_expected_user }}"
+        group: "{{ op_bridge_expected_group }}"
+        mode: "0700"
+      when: ansible_check_mode and op_bridge_manage_skill | bool
+
+    - name: Preview managed skill files
+      ansible.builtin.copy:
+        src: "{{ item.src }}"
+        dest: "{{ item.dest }}"
+        owner: "{{ op_bridge_expected_user }}"
+        group: "{{ op_bridge_expected_group }}"
+        mode: "{{ item.mode }}"
+      loop:
+        - src: ../../skills/op-bridge/SKILL.md
+          dest: "{{ op_bridge_skill_root }}/SKILL.md"
+          mode: "0644"
+        - src: ../../skills/op-bridge/agents/openai.yaml
+          dest: "{{ op_bridge_skill_root }}/agents/openai.yaml"
+          mode: "0600"
+      when: ansible_check_mode and op_bridge_manage_skill | bool
+
+    - name: Explain check mode limits
+      ansible.builtin.debug:
+        msg: >-
+          Check mode validates target identity and release checksum and previews
+          configuration, LaunchAgent, Terminal launcher, and skill files. It does not unpack or run
+          the target binary, generate sudoers, stop a session, activate files, or
+          bootstrap launchd.
+      when: ansible_check_mode
+
+    - name: Install and verify the staged release
+      when: not ansible_check_mode
+      block:
+        - name: Remove stale non-recovery staging
+          ansible.builtin.file:
+            path: "{{ op_bridge_stage_root }}"
+            state: absent
+
+        - name: Create private staging directory
+          ansible.builtin.file:
+            path: "{{ op_bridge_stage_root }}"
+            state: directory
+            owner: root
+            group: "{{ op_bridge_root_group }}"
+            mode: "0700"
+
+        - name: Transfer the checksummed release artifact
+          ansible.builtin.copy:
+            src: "{{ op_bridge_controller_artifact }}"
+            dest: "{{ op_bridge_stage_archive }}"
+            owner: root
+            group: "{{ op_bridge_root_group }}"
+            mode: "0600"
+
+        - name: Verify the transferred release checksum
+          ansible.builtin.stat:
+            path: "{{ op_bridge_stage_archive }}"
+            checksum_algorithm: sha256
+          register: op_bridge_remote_artifact
+          failed_when: op_bridge_remote_artifact.stat.checksum != op_bridge_release_checksum
+
+        - name: Unpack the release into staging
+          ansible.builtin.command:
+            argv:
+              - /usr/bin/tar
+              - -xzf
+              - "{{ op_bridge_stage_archive }}"
+              - -C
+              - "{{ op_bridge_stage_root }}"
+          changed_when: true
+
+        - name: Render the complete host configuration in staging
+          ansible.builtin.template:
+            src: templates/op-bridge.json.j2
+            dest: "{{ op_bridge_stage_config }}"
+            owner: root
+            group: "{{ op_bridge_root_group }}"
+            mode: "0644"
+
+        - name: Validate the staged configuration with the staged binary
+          ansible.builtin.command:
+            argv:
+              - "{{ op_bridge_stage_bundle }}/op-bridge"
+              - config
+              - check
+              - "{{ op_bridge_stage_config }}"
+          changed_when: false
+
+        - name: Generate the exact staged sudoers rule
+          ansible.builtin.command:
+            argv:
+              - "{{ op_bridge_stage_bundle }}/op-bridge"
+              - config
+              - sudoers
+              - "{{ op_bridge_stage_config }}"
+          register: op_bridge_generated_sudoers
+          changed_when: false
+          when: op_bridge_has_sudo_rule | bool
+
+        - name: Write the generated sudoers rule into staging
+          ansible.builtin.copy:
+            content: "{{ op_bridge_generated_sudoers.stdout }}\n"
+            dest: "{{ op_bridge_stage_sudoers }}"
+            owner: root
+            group: "{{ op_bridge_root_group }}"
+            mode: "0440"
+          when: op_bridge_has_sudo_rule | bool
+
+        - name: Validate the staged sudoers rule
+          ansible.builtin.command:
+            argv:
+              - /usr/sbin/visudo
+              - -cf
+              - "{{ op_bridge_stage_sudoers }}"
+          changed_when: false
+          when: op_bridge_has_sudo_rule | bool
+
+        - name: Validate the staged macOS LaunchAgent
+          ansible.builtin.command:
+            argv:
+              - /usr/bin/plutil
+              - -lint
+              - "{{ op_bridge_stage_bundle }}/deploy/macos/com.adenta.op-bridge.session.plist"
+          changed_when: false
+          when: op_bridge_launch_agent | bool
+
+        - name: Validate the staged Terminal launcher syntax
+          ansible.builtin.command:
+            argv:
+              - /bin/sh
+              - -n
+              - "{{ op_bridge_stage_bundle }}/deploy/macos/Launch.command"
+          changed_when: false
+          when: op_bridge_launch_agent | bool
+
+        - name: Inspect currently managed paths
+          ansible.builtin.stat:
+            path: "{{ item.path }}"
+            follow: false
+          loop:
+            - name: binary
+              path: "{{ op_bridge_binary }}"
+            - name: link
+              path: "{{ op_bridge_link }}"
+            - name: config
+              path: "{{ op_bridge_config_path }}"
+            - name: sudoers
+              path: "{{ op_bridge_sudoers }}"
+          register: op_bridge_core_paths
+
+        - name: Index current core path state
+          ansible.builtin.set_fact:
+            op_bridge_current_binary: "{{ op_bridge_core_paths.results[0] }}"
+            op_bridge_current_link: "{{ op_bridge_core_paths.results[1] }}"
+            op_bridge_current_config: "{{ op_bridge_core_paths.results[2] }}"
+            op_bridge_current_sudoers: "{{ op_bridge_core_paths.results[3] }}"
+
+        - name: Inspect the current LaunchAgent
+          ansible.builtin.stat:
+            path: "{{ op_bridge_launch_agent_path }}"
+            follow: false
+          register: op_bridge_current_launch_agent
+          when: op_bridge_launch_agent | bool
+
+        - name: Inspect the current Terminal launcher
+          ansible.builtin.stat:
+            path: "{{ op_bridge_terminal_launcher }}"
+            follow: false
+          register: op_bridge_current_terminal_launcher
+          when: op_bridge_launch_agent | bool
+
+        - name: Refuse an unexpected Terminal launcher path type
+          ansible.builtin.assert:
+            that: not op_bridge_current_terminal_launcher.stat.exists or op_bridge_current_terminal_launcher.stat.isreg
+          when: op_bridge_launch_agent | bool
+
+        - name: Inspect current managed skill files
+          ansible.builtin.stat:
+            path: "{{ item }}"
+            follow: false
+          loop:
+            - "{{ op_bridge_skill_root }}/SKILL.md"
+            - "{{ op_bridge_skill_root }}/agents/openai.yaml"
+          register: op_bridge_current_skill_files
+          when: op_bridge_manage_skill | bool
+
+        - name: Refuse unexpected managed path types
+          ansible.builtin.assert:
+            that:
+              - not op_bridge_current_binary.stat.exists or op_bridge_current_binary.stat.isreg
+              - not op_bridge_current_config.stat.exists or op_bridge_current_config.stat.isreg
+              - not op_bridge_current_sudoers.stat.exists or op_bridge_current_sudoers.stat.isreg
+              - not op_bridge_current_link.stat.exists or op_bridge_current_link.stat.islnk
+            fail_msg: A managed path has an unexpected type; refusing replacement.
+
+        - name: Refuse an unexpected LaunchAgent path type
+          ansible.builtin.assert:
+            that: not op_bridge_current_launch_agent.stat.exists or op_bridge_current_launch_agent.stat.isreg
+            fail_msg: The managed LaunchAgent path is not a regular file.
+          when: op_bridge_launch_agent | bool
+
+        - name: Refuse unexpected managed skill path types
+          ansible.builtin.assert:
+            that: not item.stat.exists or item.stat.isreg
+            fail_msg: A managed skill path is not a regular file.
+          loop: "{{ op_bridge_current_skill_files.results | default([]) }}"
+          when: op_bridge_manage_skill | bool
+
+        - name: Check current LaunchAgent registration
+          ansible.builtin.command:
+            argv:
+              - /bin/launchctl
+              - print
+              - "gui/{{ op_bridge_owner_uid }}/{{ op_bridge_launch_agent_label }}"
+          changed_when: false
+          failed_when: false
+          register: op_bridge_old_launch_agent_registration
+          when: op_bridge_launch_agent | bool
+
+        - name: Create private recovery directory
+          ansible.builtin.file:
+            path: "{{ op_bridge_recovery_root }}"
+            state: directory
+            owner: root
+            group: "{{ op_bridge_root_group }}"
+            mode: "0700"
+
+        - name: Preserve current core regular files exactly
+          ansible.builtin.copy:
+            src: "{{ item.source }}"
+            dest: "{{ op_bridge_recovery_root }}/{{ item.backup }}"
+            remote_src: true
+            owner: root
+            group: "{{ op_bridge_root_group }}"
+            mode: preserve
+          loop:
+            - source: "{{ op_bridge_binary }}"
+              backup: binary
+              state: "{{ op_bridge_current_binary }}"
+            - source: "{{ op_bridge_config_path }}"
+              backup: config
+              state: "{{ op_bridge_current_config }}"
+            - source: "{{ op_bridge_sudoers }}"
+              backup: sudoers
+              state: "{{ op_bridge_current_sudoers }}"
+          when: item.state.stat.exists
+
+        - name: Preserve the current Terminal launcher exactly
+          ansible.builtin.copy:
+            src: "{{ op_bridge_terminal_launcher }}"
+            dest: "{{ op_bridge_recovery_root }}/terminal-launcher"
+            remote_src: true
+            owner: root
+            group: "{{ op_bridge_root_group }}"
+            mode: preserve
+          when: op_bridge_launch_agent | bool and op_bridge_current_terminal_launcher.stat.exists
+
+        - name: Preserve the current LaunchAgent exactly
+          ansible.builtin.copy:
+            src: "{{ op_bridge_launch_agent_path }}"
+            dest: "{{ op_bridge_recovery_root }}/launch-agent.plist"
+            remote_src: true
+            owner: root
+            group: "{{ op_bridge_root_group }}"
+            mode: preserve
+          when: op_bridge_launch_agent | bool and op_bridge_current_launch_agent.stat.exists
+
+        - name: Preserve current managed skill files exactly
+          ansible.builtin.copy:
+            src: "{{ item.item }}"
+            dest: "{{ op_bridge_recovery_root }}/skill-{{ ansible_loop.index0 }}"
+            remote_src: true
+            owner: root
+            group: "{{ op_bridge_root_group }}"
+            mode: preserve
+          loop: "{{ op_bridge_current_skill_files.results | default([]) }}"
+          loop_control:
+            extended: true
+          when: op_bridge_manage_skill | bool and item.stat.exists
+
+        - name: Check the existing local session
+          ansible.builtin.command:
+            argv:
+              - "{{ op_bridge_binary }}"
+              - --desktop
+              - "{{ op_bridge_local_desktop }}"
+              - session
+              - status
+          become: false
+          changed_when: false
+          register: op_bridge_old_session
+          when:
+            - op_bridge_local_desktop | length > 0
+            - op_bridge_current_binary.stat.exists
+
+        - name: Refuse deployment while a local request is pending
+          ansible.builtin.assert:
+            that: (op_bridge_old_session.stdout | from_json).pending | int == 0
+            fail_msg: A local op-bridge request is pending; deployment was not activated.
+          when:
+            - op_bridge_old_session is not skipped
+            - op_bridge_old_session.stdout.startswith('{')
+
+        - name: Mark the matched installation ready for activation
+          ansible.builtin.set_fact:
+            op_bridge_activation_started: true
+
+        - name: Stop the existing local session before activation
+          ansible.builtin.command:
+            argv:
+              - "{{ op_bridge_binary }}"
+              - --desktop
+              - "{{ op_bridge_local_desktop }}"
+              - session
+              - stop
+          become: false
+          changed_when: true
+          when:
+            - op_bridge_old_session is not skipped
+            - op_bridge_old_session.stdout.startswith('{')
+
+        - name: Wait for the old local session to stop
+          ansible.builtin.command:
+            argv:
+              - "{{ op_bridge_binary }}"
+              - --desktop
+              - "{{ op_bridge_local_desktop }}"
+              - session
+              - status
+          become: false
+          changed_when: false
+          register: op_bridge_old_session_stopped
+          until: "op_bridge_old_session_stopped.stdout | trim == 'session: stopped'"
+          retries: 15
+          delay: 1
+          when: op_bridge_old_session is not skipped and op_bridge_old_session.stdout.startswith('{')
+
+        - name: Remove old LaunchAgent registration before replacement
+          ansible.builtin.command:
+            argv:
+              - /bin/launchctl
+              - bootout
+              - "gui/{{ op_bridge_owner_uid }}/{{ op_bridge_launch_agent_label }}"
+          changed_when: true
+          when:
+            - op_bridge_launch_agent | bool
+            - op_bridge_old_launch_agent_registration.rc == 0
+
+        - name: Ensure application directories exist
+          ansible.builtin.file:
+            path: "{{ item.path }}"
+            state: directory
+            owner: "{{ item.owner }}"
+            group: "{{ item.group }}"
+            mode: "{{ item.mode }}"
+          loop:
+            - path: /usr/local/libexec/op-bridge
+              owner: root
+              group: "{{ op_bridge_root_group }}"
+              mode: "0755"
+            - path: /usr/local/bin
+              owner: root
+              group: "{{ op_bridge_root_group }}"
+              mode: "0755"
+
+        - name: Ensure the owner LaunchAgents directory exists
+          ansible.builtin.file:
+            path: "{{ op_bridge_launch_agent_path | dirname }}"
+            state: directory
+            owner: "{{ op_bridge_owner }}"
+            group: "{{ op_bridge_owner_group }}"
+            mode: "0755"
+          when: op_bridge_launch_agent | bool
+
+        - name: Activate the release binary
+          ansible.builtin.copy:
+            src: "{{ op_bridge_stage_bundle }}/op-bridge"
+            dest: "{{ op_bridge_binary }}"
+            remote_src: true
+            owner: root
+            group: "{{ op_bridge_root_group }}"
+            mode: "0755"
+
+        - name: Activate the host configuration
+          ansible.builtin.copy:
+            src: "{{ op_bridge_stage_config }}"
+            dest: "{{ op_bridge_config_path }}"
+            remote_src: true
+            owner: root
+            group: "{{ op_bridge_root_group }}"
+            mode: "0644"
+
+        - name: Activate the exact sudoers rule
+          ansible.builtin.copy:
+            src: "{{ op_bridge_stage_sudoers }}"
+            dest: "{{ op_bridge_sudoers }}"
+            remote_src: true
+            owner: root
+            group: "{{ op_bridge_root_group }}"
+            mode: "0440"
+            validate: /usr/sbin/visudo -cf %s
+          when: op_bridge_has_sudo_rule | bool
+
+        - name: Remove an obsolete op-bridge sudoers rule
+          ansible.builtin.file:
+            path: "{{ op_bridge_sudoers }}"
+            state: absent
+          when: not (op_bridge_has_sudo_rule | bool)
+
+        - name: Activate the command symlink
+          ansible.builtin.file:
+            src: "{{ op_bridge_binary }}"
+            dest: "{{ op_bridge_link }}"
+            state: link
+            owner: root
+            group: "{{ op_bridge_root_group }}"
+            force: true
+
+        - name: Activate the macOS Terminal launcher
+          ansible.builtin.copy:
+            src: "{{ op_bridge_stage_bundle }}/deploy/macos/Launch.command"
+            dest: "{{ op_bridge_terminal_launcher }}"
+            remote_src: true
+            owner: root
+            group: "{{ op_bridge_root_group }}"
+            mode: "0755"
+          when: op_bridge_launch_agent | bool
+
+        - name: Activate the macOS LaunchAgent file
+          ansible.builtin.copy:
+            src: "{{ op_bridge_stage_bundle }}/deploy/macos/com.adenta.op-bridge.session.plist"
+            dest: "{{ op_bridge_launch_agent_path }}"
+            remote_src: true
+            owner: "{{ op_bridge_owner }}"
+            group: "{{ op_bridge_owner_group }}"
+            mode: "0644"
+          when: op_bridge_launch_agent | bool
+
+        - name: Register the dormant Aqua LaunchAgent
+          ansible.builtin.command:
+            argv:
+              - /bin/launchctl
+              - bootstrap
+              - "gui/{{ op_bridge_owner_uid }}"
+              - "{{ op_bridge_launch_agent_path }}"
+          changed_when: true
+          when: op_bridge_launch_agent | bool
+
+        - name: Ensure the managed skill directory exists
+          ansible.builtin.file:
+            path: "{{ op_bridge_skill_root }}/agents"
+            state: directory
+            owner: "{{ op_bridge_expected_user }}"
+            group: "{{ op_bridge_expected_group }}"
+            mode: "0700"
+          when: op_bridge_manage_skill | bool
+
+        - name: Activate managed skill files
+          ansible.builtin.copy:
+            src: "{{ item.src }}"
+            dest: "{{ item.dest }}"
+            remote_src: true
+            owner: "{{ op_bridge_expected_user }}"
+            group: "{{ op_bridge_expected_group }}"
+            mode: "{{ item.mode }}"
+          loop:
+            - src: "{{ op_bridge_stage_bundle }}/skills/op-bridge/SKILL.md"
+              dest: "{{ op_bridge_skill_root }}/SKILL.md"
+              mode: "0644"
+            - src: "{{ op_bridge_stage_bundle }}/skills/op-bridge/agents/openai.yaml"
+              dest: "{{ op_bridge_skill_root }}/agents/openai.yaml"
+              mode: "0600"
+          when: op_bridge_manage_skill | bool
+
+        - name: Verify the installed version
+          ansible.builtin.command:
+            argv:
+              - "{{ op_bridge_binary }}"
+              - --version
+          changed_when: false
+          register: op_bridge_installed_version
+          failed_when: op_bridge_installed_version.stdout != ('op-bridge ' ~ op_bridge_version)
+
+        - name: Verify the installed route
+          ansible.builtin.command:
+            argv:
+              - "{{ op_bridge_binary }}"
+              - route
+              - show
+              - --format=json
+          changed_when: false
+          register: op_bridge_installed_route
+          failed_when: >-
+            (op_bridge_installed_route.stdout | from_json).desktop != op_bridge_config.default_desktop
+            or (op_bridge_installed_route.stdout | from_json).execution_host != op_bridge_config.machine
+
+        - name: Verify local desktop prerequisites without starting a session
+          ansible.builtin.command:
+            argv:
+              - "{{ op_bridge_binary }}"
+              - --desktop
+              - "{{ op_bridge_local_desktop }}"
+              - session
+              - doctor
+          become: false
+          changed_when: false
+          register: op_bridge_local_doctor
+          failed_when: >-
+            (op_bridge_require_local_doctor | default(false) | bool)
+            and op_bridge_local_doctor.rc != 0
+          when: op_bridge_local_desktop | length > 0
+
+        - name: Verify LaunchAgent registration and dormancy
+          ansible.builtin.command:
+            argv:
+              - /bin/launchctl
+              - print
+              - "gui/{{ op_bridge_owner_uid }}/{{ op_bridge_launch_agent_label }}"
+          changed_when: false
+          register: op_bridge_launch_agent_status
+          failed_when: "'state = running' in op_bridge_launch_agent_status.stdout"
+          when: op_bridge_launch_agent | bool
+
+        - name: Verify the dormant macOS socket is absent
+          ansible.builtin.stat:
+            path: "{{ op_bridge_owner_home }}/Library/Caches/op-bridge/session.sock"
+          register: op_bridge_dormant_socket
+          failed_when: op_bridge_dormant_socket.stat.exists
+          when: op_bridge_launch_agent | bool
+
+        - name: Remove successful deployment recovery data
+          ansible.builtin.file:
+            path: "{{ op_bridge_recovery_root }}"
+            state: absent
+
+        - name: Remove successful deployment staging data
+          ansible.builtin.file:
+            path: "{{ op_bridge_stage_root }}"
+            state: absent
+
+      rescue:
+        - name: Inspect the active binary before stopping recovery session
+          ansible.builtin.stat:
+            path: "{{ op_bridge_binary }}"
+          register: op_bridge_recovery_binary
+          when: op_bridge_activation_started | bool
+
+        # A Terminal server is not a launchd child: bootout alone cannot stop it.
+        # Fail closed and retain recovery files if stop/verification fails.
+        - name: Stop the active local session before restoring any files
+          ansible.builtin.command:
+            argv:
+              - "{{ op_bridge_binary }}"
+              - --desktop
+              - "{{ op_bridge_local_desktop }}"
+              - session
+              - stop
+          become: false
+          changed_when: true
+          when: op_bridge_activation_started | bool and op_bridge_local_desktop | length > 0 and op_bridge_recovery_binary.stat.exists
+
+        - name: Wait for the recovery session to stop
+          ansible.builtin.command:
+            argv:
+              - "{{ op_bridge_binary }}"
+              - --desktop
+              - "{{ op_bridge_local_desktop }}"
+              - session
+              - status
+          become: false
+          changed_when: false
+          register: op_bridge_recovery_session_stopped
+          until: "op_bridge_recovery_session_stopped.stdout | trim == 'session: stopped'"
+          retries: 15
+          delay: 1
+          when: op_bridge_activation_started | bool and op_bridge_local_desktop | length > 0 and op_bridge_recovery_binary.stat.exists
+
+        - name: Stop a newly registered LaunchAgent before recovery
+          ansible.builtin.command:
+            argv:
+              - /bin/launchctl
+              - bootout
+              - "gui/{{ op_bridge_owner_uid }}/{{ op_bridge_launch_agent_label }}"
+          changed_when: true
+          failed_when: false
+          when: op_bridge_launch_agent | bool and op_bridge_activation_started | bool
+
+        - name: Restore previous core regular files
+          ansible.builtin.copy:
+            src: "{{ op_bridge_recovery_root }}/{{ item.backup }}"
+            dest: "{{ item.dest }}"
+            remote_src: true
+            owner: root
+            group: "{{ item.state.stat.gr_name }}"
+            mode: "{{ item.mode }}"
+          loop:
+            - backup: binary
+              dest: "{{ op_bridge_binary }}"
+              mode: "{{ op_bridge_current_binary.stat.mode | default('0755') }}"
+              state: "{{ op_bridge_current_binary }}"
+            - backup: config
+              dest: "{{ op_bridge_config_path }}"
+              mode: "{{ op_bridge_current_config.stat.mode | default('0644') }}"
+              state: "{{ op_bridge_current_config }}"
+            - backup: sudoers
+              dest: "{{ op_bridge_sudoers }}"
+              mode: "{{ op_bridge_current_sudoers.stat.mode | default('0440') }}"
+              state: "{{ op_bridge_current_sudoers }}"
+          when: op_bridge_activation_started | bool and item.state.stat.exists
+
+        - name: Remove newly created core regular files during recovery
+          ansible.builtin.file:
+            path: "{{ item.dest }}"
+            state: absent
+          loop:
+            - dest: "{{ op_bridge_binary }}"
+              state: "{{ op_bridge_current_binary }}"
+            - dest: "{{ op_bridge_config_path }}"
+              state: "{{ op_bridge_current_config }}"
+            - dest: "{{ op_bridge_sudoers }}"
+              state: "{{ op_bridge_current_sudoers }}"
+          when: op_bridge_activation_started | bool and not item.state.stat.exists
+
+        - name: Restore the previous command symlink
+          ansible.builtin.file:
+            src: "{{ op_bridge_current_link.stat.lnk_source }}"
+            dest: "{{ op_bridge_link }}"
+            state: link
+            owner: root
+            group: "{{ op_bridge_root_group }}"
+            force: true
+          when: op_bridge_activation_started | bool and op_bridge_current_link.stat.exists
+
+        - name: Remove a newly created command symlink during recovery
+          ansible.builtin.file:
+            path: "{{ op_bridge_link }}"
+            state: absent
+          when: op_bridge_activation_started | bool and not op_bridge_current_link.stat.exists
+
+        - name: Restore the previous Terminal launcher
+          ansible.builtin.copy:
+            src: "{{ op_bridge_recovery_root }}/terminal-launcher"
+            dest: "{{ op_bridge_terminal_launcher }}"
+            remote_src: true
+            owner: "{{ op_bridge_current_terminal_launcher.stat.pw_name }}"
+            group: "{{ op_bridge_current_terminal_launcher.stat.gr_name }}"
+            mode: "{{ op_bridge_current_terminal_launcher.stat.mode }}"
+          when: op_bridge_activation_started | bool and op_bridge_launch_agent | bool and op_bridge_current_terminal_launcher.stat.exists
+
+        - name: Remove a newly created Terminal launcher during recovery
+          ansible.builtin.file:
+            path: "{{ op_bridge_terminal_launcher }}"
+            state: absent
+          when: op_bridge_activation_started | bool and op_bridge_launch_agent | bool and not op_bridge_current_terminal_launcher.stat.exists
+
+        - name: Restore the previous LaunchAgent file
+          ansible.builtin.copy:
+            src: "{{ op_bridge_recovery_root }}/launch-agent.plist"
+            dest: "{{ op_bridge_launch_agent_path }}"
+            remote_src: true
+            owner: "{{ op_bridge_current_launch_agent.stat.pw_name }}"
+            group: "{{ op_bridge_current_launch_agent.stat.gr_name }}"
+            mode: "{{ op_bridge_current_launch_agent.stat.mode | default('0644') }}"
+          when: op_bridge_activation_started | bool and op_bridge_launch_agent | bool and op_bridge_current_launch_agent.stat.exists
+
+        - name: Remove a newly created LaunchAgent file during recovery
+          ansible.builtin.file:
+            path: "{{ op_bridge_launch_agent_path }}"
+            state: absent
+          when: op_bridge_activation_started | bool and op_bridge_launch_agent | bool and not op_bridge_current_launch_agent.stat.exists
+
+        - name: Restore previous managed skill files
+          ansible.builtin.copy:
+            src: "{{ op_bridge_recovery_root }}/skill-{{ ansible_loop.index0 }}"
+            dest: "{{ item.item }}"
+            remote_src: true
+            owner: "{{ item.stat.pw_name }}"
+            group: "{{ item.stat.gr_name }}"
+            mode: "{{ item.stat.mode | default('0644') }}"
+          loop: "{{ op_bridge_current_skill_files.results | default([]) }}"
+          loop_control:
+            extended: true
+          when: op_bridge_activation_started | bool and op_bridge_manage_skill | bool and item.stat.exists
+
+        - name: Remove newly created managed skill files during recovery
+          ansible.builtin.file:
+            path: "{{ item.item }}"
+            state: absent
+          loop: "{{ op_bridge_current_skill_files.results | default([]) }}"
+          when: op_bridge_activation_started | bool and op_bridge_manage_skill | bool and not item.stat.exists
+
+        - name: Restore prior LaunchAgent registration state
+          ansible.builtin.command:
+            argv:
+              - /bin/launchctl
+              - bootstrap
+              - "gui/{{ op_bridge_owner_uid }}"
+              - "{{ op_bridge_launch_agent_path }}"
+          changed_when: true
+          when:
+            - op_bridge_launch_agent | bool
+            - op_bridge_activation_started | bool
+            - op_bridge_old_launch_agent_registration.rc == 0
+
+        - name: Validate restored configuration
+          ansible.builtin.command:
+            argv:
+              - "{{ op_bridge_binary }}"
+              - route
+              - show
+              - --format=json
+          changed_when: false
+          when:
+            - op_bridge_activation_started | bool
+            - op_bridge_current_binary.stat.exists
+            - op_bridge_current_config.stat.exists
+
+        - name: Remove recovery data after successful restoration
+          ansible.builtin.file:
+            path: "{{ op_bridge_recovery_root }}"
+            state: absent
+
+        - name: Remove failed deployment staging data
+          ansible.builtin.file:
+            path: "{{ op_bridge_stage_root }}"
+            state: absent
+
+        - name: Report restored deployment failure
+          ansible.builtin.fail:
+            msg: >-
+              Deployment failed. Any activated managed files were restored; a
+              failure during staging made no installation changes.

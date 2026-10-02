@@ -1,4 +1,4 @@
-//go:build linux
+//go:build linux || (darwin && arm64)
 
 package secrets
 
@@ -21,13 +21,13 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/creack/pty"
 	"github.com/google/uuid"
 	"golang.org/x/sys/unix"
 )
 
 const ConfigPath = "/etc/op-bridge.json"
 const InstalledBinary = "/usr/local/libexec/op-bridge/op-bridge"
-const unitName = "op-bridge-session.service"
 const sessionIdleLimit = 2 * time.Minute
 const workerLifetime = 10 * time.Minute
 
@@ -44,6 +44,9 @@ func owner(c Config) (*user.User, error) {
 
 func privateRuntime(u *user.User) (string, error) {
 	d, socket := runtimePaths(u)
+	if err := validateRuntimePath(u); err != nil {
+		return "", err
+	}
 	if err := os.Mkdir(d, 0700); err != nil && !os.IsExist(err) {
 		return "", fmt.Errorf("desktop runtime is unavailable; log in to the configured desktop as %s", u.Username)
 	}
@@ -56,6 +59,25 @@ func privateRuntime(u *user.User) (string, error) {
 		return "", fmt.Errorf("runtime owner mismatch")
 	}
 	return socket, nil
+}
+
+func validateRuntimePath(u *user.User) error {
+	if err := validateRuntimeParent(u); err != nil {
+		return err
+	}
+	d, _ := runtimePaths(u)
+	s, err := os.Lstat(d)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil || !s.IsDir() || s.Mode().Perm() != 0700 {
+		return fmt.Errorf("unsafe runtime directory")
+	}
+	st, ok := s.Sys().(*syscall.Stat_t)
+	if !ok || strconv.FormatUint(uint64(st.Uid), 10) != u.Uid {
+		return fmt.Errorf("runtime owner mismatch")
+	}
+	return nil
 }
 
 func decodeRequest(r io.Reader, p Policy) (Request, error) {
@@ -106,8 +128,8 @@ func timeoutFor(r Request) time.Duration {
 
 func Main(args []string, input io.Reader, output, errorOutput io.Writer) int {
 	if len(args) == 0 || (len(args) == 1 && (args[0] == "--help" || args[0] == "-h")) {
-		fmt.Fprintln(output, "Usage: op-bridge [--desktop NAME] [--timeout SECONDS] vault list|item list|item get ITEM|read REFERENCE [op options]\n       op-bridge [--desktop NAME] [--timeout SECONDS] item create - [--vault VAULT] [--format FORMAT] [--dry-run] < item.json\n       op-bridge [--desktop NAME] [--timeout SECONDS] item edit ITEM [--vault VAULT] [--format FORMAT] [--dry-run] < item.json\n       op-bridge [--desktop NAME] session status|doctor|stop\n       op-bridge [--desktop NAME] route show [--format=json]\nWrites require JSON on stdin; no file options or attachments. Linux with a configured 1Password approval desktop. Overrides apply to this invocation. Session stop affects all tasks on the selected desktop. Output can contain secrets.")
-		fmt.Fprintln(output, "Sessions expire after 2 idle minutes; terminal approval reuse is capped at 10 minutes, allowing active operations to finish. Every secret operation requires a desktop notification (5-second expiry, vault/item identifiers only). Unavailable notifications block access. Status reports session limits; doctor checks notification-service availability. Desktop settings may suppress banners.")
+		fmt.Fprintln(output, "Usage: op-bridge [--desktop NAME] [--timeout SECONDS] vault list|item list|item get ITEM|read REFERENCE [op options]\n       op-bridge [--desktop NAME] [--timeout SECONDS] item create - [--vault VAULT] [--format FORMAT] [--dry-run] < item.json\n       op-bridge [--desktop NAME] [--timeout SECONDS] item edit ITEM [--vault VAULT] [--format FORMAT] [--dry-run] < item.json\n       op-bridge [--desktop NAME] session status|doctor|stop\n       op-bridge [--desktop NAME] route show [--format=json]\nWrites require JSON on stdin; no file options or attachments. Linux or macOS arm64 with a configured 1Password approval desktop. Overrides apply to this invocation. Session stop affects all tasks on the selected desktop. Output can contain secrets.")
+		fmt.Fprintln(output, "Sessions expire after 2 idle minutes; terminal approval reuse is capped at 10 minutes, allowing active operations to finish. Status reports session limits; doctor checks desktop prerequisites.")
 		fmt.Fprintln(output, "Setup: op-bridge config check|sudoers FILE (inspect staging policy only). Version: op-bridge --version.")
 		return 0
 	}
@@ -207,12 +229,15 @@ func bridge(ctx context.Context, c Config, u *user.User, r Request) Response {
 	_, socket := runtimePaths(u)
 	if r.Action == "doctor" {
 		_, opErr := os.Stat(opBinary)
-		runtimeErr := desktopAvailable(u)
-		notifications := desktopNotifications{socket: "/run/user/" + u.Uid + "/bus", policy: Policy{Account: c.Local.Account}}
-		notificationsAvailable := notifications.available(ctx)
-		data, _ := json.Marshal(map[string]any{"desktop_user": u.Username, "account": c.Local.Account, "cli_available": opErr == nil, "desktop_bus_available": runtimeErr == nil, "notification_service_available": notificationsAvailable})
+		runtimeErr := validateRuntimePath(u)
+		checks := platformDoctor(u)
+		checks["desktop_user"] = u.Username
+		checks["account"] = c.Local.Account
+		checks["cli_available"] = opErr == nil
+		checks["runtime_path_available"] = runtimeErr == nil
+		data, _ := json.Marshal(checks)
 		result := Response{Version: Protocol, Stdout: append(data, '\n')}
-		if opErr != nil || runtimeErr != nil || !notificationsAvailable {
+		if opErr != nil || runtimeErr != nil || !platformDoctorOK(checks) {
 			result.Exit = 1
 		}
 		return result
@@ -225,22 +250,9 @@ func bridge(ctx context.Context, c Config, u *user.User, r Request) Response {
 		if _, e := privateRuntime(u); e != nil {
 			return failure(e.Error())
 		}
-		startCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-		_ = startSession(startCtx, u, Policy{Account: c.Local.Account})
-		cancel()
-		for i := 0; i < 50; i++ {
-			conn, err = net.DialTimeout("unix", socket, 100*time.Millisecond)
-			if err == nil {
-				break
-			}
-			select {
-			case <-ctx.Done():
-				return failure("request cancelled")
-			case <-time.After(100 * time.Millisecond):
-			}
-		}
+		conn, err = connectSession(ctx, u, Policy{Account: c.Local.Account}, socket)
 		if err != nil {
-			return failure("desktop session could not start; run op-bridge session doctor")
+			return failure(err.Error())
 		}
 	}
 	defer conn.Close()
@@ -296,7 +308,7 @@ func (w *worker) send(r Request) (uint64, error) {
 
 func startWorker(program string, args, env []string) (*worker, error) {
 	started := time.Now()
-	master, slave, err := openPTY()
+	master, slave, err := pty.Open()
 	if err != nil {
 		return nil, err
 	}
@@ -491,7 +503,6 @@ func serve(c Config, u *user.User, idle time.Duration) error {
 	}
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP)
 	defer cancel()
-	notifications := desktopNotifications{socket: "/run/user/" + u.Uid + "/bus", policy: Policy{Account: c.Local.Account}}
 	history := &accessHistory{dir: historyPath(u), now: time.Now}
 	record := history.append
 	if err := record(historyEvent{}); err != nil {
@@ -503,7 +514,6 @@ func serve(c Config, u *user.User, idle time.Duration) error {
 		start: func() (*worker, error) {
 			return startWorker(InstalledBinary, []string{"_worker"}, desktopEnv(u, Policy{Account: c.Local.Account}))
 		},
-		notify:  notifications.notify,
 		history: record,
 	})
 }
@@ -512,7 +522,6 @@ type sessionPolicy struct {
 	policy       Policy
 	idle, maxAge time.Duration
 	start        func() (*worker, error)
-	notify       func(context.Context, Request) error
 	history      func(historyEvent) error
 }
 
@@ -655,19 +664,8 @@ func serveRequests(ctx context.Context, stop context.CancelFunc, listener net.Li
 				reply(notStarted("request cancelled or timed out while queued; operation not started"))
 				return
 			}
-			if err := policy.notify(reqCtx, r); err != nil {
-				event.Reason = "notification_unavailable"
-				reply(notStarted("desktop notification unavailable or not accepted; operation not started"))
-				return
-			}
-			event.NotificationAccepted = true
-			if reqCtx.Err() != nil {
-				event.Reason = "cancelled_before_dispatch"
-				reply(notStarted("request cancelled or timed out before dispatch; operation not started"))
-				return
-			}
-			// Only the serial dispatcher owns w. Rotate after notification delivery
-			// so crossing the age limit during that call cannot reuse approval.
+			// Only the serial dispatcher owns w. Rotate before dispatch so an
+			// expired terminal authorization context is never reused.
 			if time.Since(w.started) >= policy.maxAge {
 				w.close()
 				w, err = policy.start()

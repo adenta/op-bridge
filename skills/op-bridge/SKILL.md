@@ -6,12 +6,14 @@ description: Retrieve 1Password secrets or create and edit items through a confi
 # op-bridge
 
 Use `op-bridge` on the machine where the task runs. It manages the configured
-route, native authorization, desktop notification, and temporary shared session.
+route, native authorization, and temporary shared session.
 Use `op-bridge route show --format=json` to inspect the default route without
 starting a session or requesting approval. Use `--desktop NAME` before the
 operation to select an explicitly configured desktop for one invocation. If the
-user requests that desktop for the task, pass the override on subsequent commands
-in the task. There is no saved task preference or automatic route fallback.
+user says “I’m on XPS,” “use XPS,” “I’m on Mac,” or otherwise selects an approval
+desktop for the task, pass the corresponding `--desktop xps` or `--desktop mac`
+override on subsequent commands in that task. There is no saved task preference,
+automatic route fallback, request racing, or presence detection.
 
 ## Retrieve a value
 
@@ -71,17 +73,15 @@ op-bridge session status
 
 Use the same desktop override as the failing operation. These commands do not
 unlock 1Password or start a secrets session. Status reports helper state, not
-native authorization. Doctor checks CLI presence, the user bus, and notification
-service availability. Report failed routes or authorization; do not repeatedly
-retry. Do not change SSH identities, sudo rules, or authentication as a workaround.
+native authorization. Doctor checks the platform CLI, private runtime path, and
+desktop prerequisites; on macOS this includes the Aqua GUI domain and registered
+LaunchAgent, Terminal availability, and the trusted fixed Terminal launcher. The
+LaunchAgent opens a hidden Terminal session; unloading it alone does not stop
+the server. Use `session stop` for that. Report failed routes or authorization;
+do not repeatedly retry. Do
+not change SSH identities, sudo rules, or authentication as a workaround.
 Do not run `op signin`, copy session tokens, add accounts, or require a separate
 `op whoami`: separate terminals can have different authorization states.
-
-Every secret operation requires notification-service acceptance within two seconds.
-If it fails, report the failure; do not bypass it by calling native `op` directly
-or changing desktop settings. Banners show operation and sanitized vault/item
-identifiers, never values or templates. Identifiers may appear on a lock screen.
-Service acceptance does not prove visibility or fresh native authentication.
 
 The shared session stops after two idle minutes. Its terminal worker has a
 nonextendable ten-minute maximum lifetime; an active operation may finish within

@@ -26,8 +26,12 @@ desktop on stderr before secret requests.
 (`default` or `override`). It reads local configuration only. Session commands use
 the selected route too. `session stop` affects every caller sharing that desktop's
 session. Doctor/status/route checks do not request native authorization or keep
-the session alive. Doctor checks CLI presence, the desktop bus, and notification
-service ownership without sending a banner or activating the service.
+the session alive. On Linux, doctor checks the CLI, runtime path, and desktop bus.
+On macOS arm64, it checks `/opt/homebrew/bin/op`, the Aqua GUI domain,
+LaunchAgent registration, Terminal availability, the trusted installed launcher,
+and the private cache path. Doctor adds `terminal_available` and
+`terminal_launcher_trusted` booleans on macOS. It does not ask 1Password
+to authorize.
 
 | Operation | Supported options |
 |---|---|
@@ -60,8 +64,7 @@ private permissions and remove it afterward. Dry-run output can contain secrets.
 Writes are never retried automatically. After a disconnect, timeout, or lost
 response, the result can be unknown even if the CLI made the change. Inspect the
 item before considering another write. Protocol responses carry `not_started`
-only when execution is known not to have begun. Failed notification acceptance
-is a definite not-started result.
+only when execution is known not to have begun.
 
 Native stdout, stderr, and exit status are preserved; the helper adds route and
 failure diagnostics on stderr. Native output can itself contain secrets. Wrapper
@@ -69,10 +72,31 @@ transport errors never include request input, environment, or secret references.
 
 ## Session and resource limits
 
-The first secret request starts a transient `op-bridge-session.service` under the
-desktop owner with `Restart=no`. Nothing is enabled at login or boot. Its worker
-retains a controlling PTY inherited by native CLI processes. No command data is
-sent through the PTY, and no transcript is stored.
+On Linux, the first secret request starts a transient
+`op-bridge-session.service` under the desktop owner with `Restart=no`. On macOS
+arm64, it kickstarts the already registered
+`com.adenta.op-bridge.session` Aqua LaunchAgent. That agent has
+`RunAtLoad=false` and `KeepAlive=false`: it remains registered but dormant until
+needed. It runs `/usr/bin/open -g -j -a /System/Applications/Utilities/Terminal.app`
+with the fixed `/usr/local/libexec/op-bridge/Launch.command`, then returns to
+dormancy; the server runs inside Terminal independently of launchd. The script
+executes the installed `_serve` command without request arguments. Startup is
+serialized across callers and bounded to 15 seconds, including socket readiness;
+failure reports an error without switching to background hosting.
+The private `startup.lock` records only whether a launch was attempted and its
+timestamp. For 15 seconds after an incomplete attempt, another caller waits for
+its socket instead of opening a duplicate Terminal session. Once ready, the
+marker is cleared; the lock file remains to coordinate future processes.
+
+Terminal is requested to stay hidden and not take focus. Its preferences are not
+changed, and completed hidden tabs may remain according to existing settings.
+Quitting Terminal ends its hosted session. Use `session stop` to stop the bridge;
+unloading the LaunchAgent alone does not stop a Terminal-hosted server. This
+hosting method does not guarantee elimination of macOS access prompts.
+
+The worker retains a
+controlling PTY inherited by native CLI processes. No command data is sent
+through the PTY, and no transcript is stored.
 
 - Idle expiry: 120 seconds with no queued or active secret requests.
 - Maximum terminal worker lifetime: ten minutes from creation, measured
@@ -91,24 +115,6 @@ Disconnect/timeout cancels the CLI process group and escalates to killing a stuc
 process. Operations are never replayed. A delayed JSON trailing newline does not
 count as a disconnect. Request/response wire protocol remains version 2.
 
-## Notifications
-
-Each validated list, read, create, edit, or dry-run request must receive acceptance
-from the selected desktop's notification service before dispatch. The entire
-D-Bus connection and notification call has a two-second deadline. Missing service,
-rejection, or timeout blocks the operation. There is no silent fallback.
-
-The banner says **op-bridge: access requested** and shows the operation and supplied
-vault/item identifiers. It never includes values, field paths, write contents,
-native output, or arbitrary arguments. Identifiers are capped at 160 characters,
-stripped of control/format characters, and escaped for markup. Templates are not
-inspected for notification text. Names may appear on a lock screen.
-
-Each banner requests a five-second expiry. Desktop settings can suppress it or
-change its visible duration. Service acceptance is not proof that someone saw
-the banner, nor that 1Password displayed a fresh authentication prompt. Invalid
-requests, control commands, and requests canceled while queued do not notify.
-
 ## Access history
 
 The approval desktop stores daily JSON Lines files in its owner's
@@ -118,9 +124,9 @@ symlinks, and multiply linked history files.
 
 Validated secret requests received by the session generate `request` and
 `outcome` events joined by `request_id`. Records contain UTC time, operation,
-dry-run flag, notification-safe identifiers, notification acceptance, and an
-outcome (`success`, `failure`, `not_started`, or `unknown`). Native exit status is
-included when available. Reasons use fixed codes, not raw errors.
+dry-run flag, sanitized identifiers, and an outcome (`success`, `failure`,
+`not_started`, or `unknown`). Native exit status is included when available.
+Reasons use fixed codes, not raw errors.
 
 There are no values, templates, field paths, native output, task identities, or
 newly created item IDs in history. An incomplete request is not evidence of

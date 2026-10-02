@@ -1,0 +1,178 @@
+---
+# Exercise the actual recovery tasks against disposable files and a fake bridge.
+# No sudo, SSH, installed files, launchd, or 1Password calls.
+- name: Check Terminal launcher recovery
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: false
+  vars:
+    op_bridge_activation_started: true
+    op_bridge_launch_agent: true
+    op_bridge_local_desktop: mac
+  tasks:
+    - name: Create isolated recovery fixture
+      ansible.builtin.tempfile:
+        state: directory
+        prefix: op-bridge-recovery-test.
+      register: fixture
+
+    - name: Exercise recovery
+      block:
+        - name: Set fixture paths
+          ansible.builtin.set_fact:
+            op_bridge_binary: "{{ fixture.path }}/fake-bridge"
+            op_bridge_terminal_launcher: "{{ fixture.path }}/Launch.command"
+            op_bridge_recovery_root: "{{ fixture.path }}/recovery"
+            source_play: "{{ lookup('file', '../deploy/ansible/site.yml') | from_yaml }}"
+
+        - name: Extract shipped recovery tasks in their original order
+          ansible.builtin.set_fact:
+            recovery_tasks: >-
+              {{ (source_play[0].tasks | selectattr('name', 'equalto',
+                   'Install and verify the staged release') | first).rescue
+                 | selectattr('name', 'in', [
+                   'Inspect the active binary before stopping recovery session',
+                   'Stop the active local session before restoring any files',
+                   'Wait for the recovery session to stop',
+                   'Restore the previous Terminal launcher',
+                   'Remove a newly created Terminal launcher during recovery']) | list }}
+
+        - name: Ensure stop precedes restoration
+          ansible.builtin.assert:
+            that:
+              - recovery_tasks | length == 5
+              - recovery_tasks[1].name == 'Stop the active local session before restoring any files'
+              - recovery_tasks[2].name == 'Wait for the recovery session to stop'
+              - recovery_tasks[3].name == 'Restore the previous Terminal launcher'
+
+        - name: Write fake bridge
+          ansible.builtin.copy:
+            dest: "{{ op_bridge_binary }}"
+            mode: '0700'
+            content: |
+              #!/bin/sh
+              cd "$(dirname "$0")" || exit 1
+              case "$*" in
+                '--desktop mac session stop')
+                  [ ! -f reject-stop ] || exit 1
+                  printf 'stop\n' >> calls
+                  touch stopped
+                  echo 'session: stopping'
+                  ;;
+                '--desktop mac session status')
+                  printf 'status\n' >> calls
+                  [ -f stopped ] || exit 1
+                  echo 'session: stopped'
+                  ;;
+                *) exit 2 ;;
+              esac
+
+        - name: Create recovery directory
+          ansible.builtin.file:
+            path: "{{ op_bridge_recovery_root }}"
+            state: directory
+            mode: '0700'
+
+        - name: Save previous launcher
+          ansible.builtin.copy:
+            dest: "{{ op_bridge_recovery_root }}/terminal-launcher"
+            content: "previous launcher\n"
+            mode: '0755'
+
+        - name: Create original launcher metadata
+          ansible.builtin.copy:
+            dest: "{{ op_bridge_terminal_launcher }}"
+            content: "previous launcher\n"
+            mode: '0755'
+
+        - name: Inspect original launcher
+          ansible.builtin.stat:
+            path: "{{ op_bridge_terminal_launcher }}"
+          register: op_bridge_current_terminal_launcher
+
+        - name: Materialize selected tasks without changing their conditions
+          ansible.builtin.copy:
+            dest: "{{ fixture.path }}/tasks.yml"
+            content: "{{ recovery_tasks | to_nice_yaml }}"
+            mode: '0600'
+
+        - name: Simulate replacement launcher
+          ansible.builtin.copy:
+            dest: "{{ op_bridge_terminal_launcher }}"
+            content: "new launcher\n"
+            mode: '0700'
+
+        - name: Run rollback of an existing launcher
+          ansible.builtin.include_tasks: "{{ fixture.path }}/tasks.yml"
+
+        - name: Read restored launcher
+          ansible.builtin.slurp:
+            src: "{{ op_bridge_terminal_launcher }}"
+          register: restored
+
+        - name: Inspect restored launcher permissions
+          ansible.builtin.stat:
+            path: "{{ op_bridge_terminal_launcher }}"
+          register: restored_stat
+
+        - name: Verify original launcher contents and shutdown calls
+          ansible.builtin.assert:
+            that:
+              - restored.content | b64decode == 'previous launcher' ~ '\n'
+              - restored_stat.stat.mode == op_bridge_current_terminal_launcher.stat.mode
+              - restored_stat.stat.uid == op_bridge_current_terminal_launcher.stat.uid
+              - restored_stat.stat.gid == op_bridge_current_terminal_launcher.stat.gid
+              - lookup('file', fixture.path ~ '/calls') == 'stop' ~ '\nstatus'
+
+        - name: Represent a previous installation without a launcher
+          ansible.builtin.set_fact:
+            op_bridge_current_terminal_launcher: {stat: {exists: false}}
+
+        - name: Run rollback of a newly introduced launcher
+          ansible.builtin.include_tasks: "{{ fixture.path }}/tasks.yml"
+
+        - name: Check new launcher was removed
+          ansible.builtin.stat:
+            path: "{{ op_bridge_terminal_launcher }}"
+          register: removed
+
+        - name: Verify new file removal
+          ansible.builtin.assert:
+            that: not removed.stat.exists
+
+        - name: Simulate another activated launcher
+          ansible.builtin.copy:
+            dest: "{{ op_bridge_terminal_launcher }}"
+            content: "new launcher\n"
+            mode: '0700'
+
+        - name: Make stopping the fake server fail
+          ansible.builtin.copy:
+            dest: "{{ fixture.path }}/reject-stop"
+            content: ''
+            mode: '0600'
+
+        - name: Verify recovery fails closed when shutdown fails
+          block:
+            - ansible.builtin.include_tasks: "{{ fixture.path }}/tasks.yml"
+          rescue:
+            - ansible.builtin.set_fact:
+                shutdown_failed: true
+
+        - name: Inspect launcher after failed shutdown
+          ansible.builtin.slurp:
+            src: "{{ op_bridge_terminal_launcher }}"
+          register: untouched
+
+        - name: Verify launcher and recovery copy were preserved
+          ansible.builtin.assert:
+            that:
+              - shutdown_failed | default(false)
+              - untouched.content | b64decode == 'new launcher' ~ '\n'
+              - lookup('file', op_bridge_recovery_root ~ '/terminal-launcher') == 'previous launcher'
+      always:
+        - name: Remove disposable fixture
+          ansible.builtin.file:
+            path: "{{ fixture.path }}"
+            state: absent

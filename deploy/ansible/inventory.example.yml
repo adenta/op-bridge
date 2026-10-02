@@ -1,0 +1,39 @@
+all:
+  vars:
+    op_bridge_version: dev
+    op_bridge_expected_user: automation
+    op_bridge_expected_group: staff
+    op_bridge_root_group: root
+  children:
+    op_bridge:
+      hosts:
+        laptop:
+          ansible_host: laptop
+          ansible_user: automation
+          ansible_python_interpreter: /usr/bin/python3
+          op_bridge_expected_hostname: laptop
+          op_bridge_expected_system: Darwin
+          op_bridge_expected_architecture: arm64
+          op_bridge_root_group: wheel
+          op_bridge_artifact_os: darwin
+          op_bridge_artifact_arch: arm64
+          op_bridge_launch_agent: true
+          op_bridge_owner: alice
+          op_bridge_owner_uid: "501"
+          op_bridge_owner_group: staff
+          op_bridge_owner_home: /Users/alice
+          op_bridge_local_desktop: laptop
+          op_bridge_require_local_doctor: true
+          op_bridge_manage_skill: false
+          op_bridge_config:
+            version: 3
+            machine: laptop
+            local_bridge:
+              owner: alice
+              caller: automation
+              account: my.1password.com
+            default_desktop: laptop
+            desktops:
+              laptop:
+                transport: local
+                account: my.1password.com

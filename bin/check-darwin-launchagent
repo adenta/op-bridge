@@ -1,0 +1,85 @@
+#!/usr/bin/env bash
+set -euo pipefail
+repo=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+
+if [[ $(uname -s)/$(uname -m) != Darwin/arm64 ]]; then
+  echo 'Run the disposable LaunchAgent check on macOS arm64.' >&2
+  exit 1
+fi
+
+uid=${OP_BRIDGE_TEST_GUI_UID:-$(id -u)}
+if [[ $uid != "$(id -u)" && $EUID -ne 0 ]]; then
+  echo 'Testing another user GUI domain requires root.' >&2
+  exit 1
+fi
+label="com.adenta.op-bridge.test.$$"
+target="gui/$uid/$label"
+stage=$(mktemp -d /tmp/op-bridge-launchagent.XXXXXXXX)
+plist="$stage/$label.plist"
+marker="$stage/started"
+arguments="$stage/arguments"
+
+cleanup() {
+  /bin/launchctl bootout "$target" >/dev/null 2>&1 || true
+  rm -rf -- "$stage"
+}
+trap cleanup EXIT
+
+# Exercise the shipped job, substituting only its label and the open executable.
+# Never open Terminal, run the installed bridge, or contact 1Password in tests.
+cp "$repo/deploy/macos/com.adenta.op-bridge.session.plist" "$plist"
+test "$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments:0' "$plist")" = /usr/bin/open
+/usr/libexec/PlistBuddy -c "Set :Label $label" "$plist"
+/usr/libexec/PlistBuddy -c "Set :ProgramArguments:0 $stage/fake-open" "$plist"
+cat >"$stage/fake-open" <<EOF
+#!/bin/sh
+printf '%s\n' "\$@" > '$arguments'
+printf x >> '$marker'
+EOF
+chmod 0755 "$stage/fake-open"
+
+if [[ $uid != "$(id -u)" ]]; then
+  chown "$uid" "$stage" "$plist" "$stage/fake-open"
+fi
+
+/usr/bin/plutil -lint "$plist" >/dev/null
+/bin/launchctl bootstrap "gui/$uid" "$plist"
+/bin/launchctl print "$target" >/dev/null
+
+kickstart_and_wait() {
+  local before=0
+  if [[ -f $marker ]]; then
+    before=$(wc -c <"$marker")
+  fi
+  /bin/launchctl kickstart "$target"
+  for _ in {1..50}; do
+    if [[ -f $marker ]] && (( $(wc -c <"$marker") > before )); then
+      # The marker can be visible just before the fake launcher exits.
+      status=$(/bin/launchctl print "$target")
+      if ! grep -q 'state = running' <<<"$status"; then
+        return 0
+      fi
+    fi
+    sleep 0.1
+  done
+  echo 'Disposable LaunchAgent did not start.' >&2
+  return 1
+}
+
+kickstart_and_wait
+kickstart_and_wait
+cat >"$stage/expected" <<'EOF'
+-g
+-j
+-a
+/System/Applications/Utilities/Terminal.app
+/usr/local/libexec/op-bridge/Launch.command
+EOF
+cmp "$stage/expected" "$arguments"
+status=$(/bin/launchctl print "$target")
+if grep -q 'state = running' <<<"$status"; then
+  echo 'Disposable LaunchAgent did not return to dormancy.' >&2
+  exit 1
+fi
+
+printf '%s\n' 'Disposable Aqua LaunchAgent lifecycle passed.'

@@ -1,7 +1,6 @@
 package secrets
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -76,6 +75,15 @@ func TestHistoryPrivacyAndRetention(t *testing.T) {
 	}
 }
 
+func TestHistoryIdentifierSanitization(t *testing.T) {
+	if got := historyIdentifier("V<&>\u202e"); got != "V&lt;&amp;&gt;" {
+		t.Fatalf("unsafe identifier: %q", got)
+	}
+	if got := historyIdentifier(strings.Repeat("界", 200)); got != strings.Repeat("界", 160)+"…" {
+		t.Fatalf("identifier was not capped: %q", got)
+	}
+}
+
 func TestHistoryUnsafePathsAndConcurrentAppend(t *testing.T) {
 	for _, kind := range []string{"directory_symlink", "file_symlink", "permissions", "hardlink"} {
 		t.Run(kind, func(t *testing.T) {
@@ -137,12 +145,11 @@ func TestHistoryUnsafePathsAndConcurrentAppend(t *testing.T) {
 
 func TestSessionAccessHistory(t *testing.T) {
 	for _, tc := range []struct {
-		name, script, outcome          string
-		reject, logFail, write, dryRun bool
+		name, script, outcome  string
+		logFail, write, dryRun bool
 	}{
 		{name: "success", script: "cat >/dev/null\nprintf private-output", outcome: "success"},
 		{name: "native_failure", script: "cat >/dev/null\nexit 7", outcome: "failure"},
-		{name: "notification_rejected", script: "exit 0", outcome: "not_started", reject: true},
 		{name: "logging_failure", script: "cat >/dev/null\nexit 0", outcome: "success", logFail: true},
 		{name: "write_success", write: true, script: "cat >/dev/null\nexit 0", outcome: "success"},
 		{name: "write_failure", write: true, script: "cat >/dev/null\nexit 7", outcome: "failure"},
@@ -152,12 +159,7 @@ func TestSessionAccessHistory(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			h := newTestHistory(t)
-			policy := sessionPolicy{policy: testPolicy, idle: time.Minute, maxAge: workerLifetime, start: testWorkerFactory(t, tc.script), notify: func(context.Context, Request) error {
-				if tc.reject {
-					return fmt.Errorf("private-error")
-				}
-				return nil
-			}, history: h.append}
+			policy := sessionPolicy{policy: testPolicy, idle: time.Minute, maxAge: workerLifetime, start: testWorkerFactory(t, tc.script), history: h.append}
 			if tc.logFail {
 				policy.history = func(historyEvent) error { return fmt.Errorf("private-error") }
 			}
@@ -178,7 +180,7 @@ func TestSessionAccessHistory(t *testing.T) {
 				return
 			}
 			records := historyRecords(t, h)
-			if len(records) != 2 || records[0].ID != records[1].ID || records[0].Event != "request" || records[1].Outcome != tc.outcome || records[1].NotificationAccepted == tc.reject {
+			if len(records) != 2 || records[0].ID != records[1].ID || records[0].Event != "request" || records[1].Outcome != tc.outcome {
 				t.Fatalf("unexpected records: %+v", records)
 			}
 			data, _ := json.Marshal(records)
@@ -195,24 +197,21 @@ func TestSessionAccessHistory(t *testing.T) {
 
 func TestHistoryQueuedCancellation(t *testing.T) {
 	h := newTestHistory(t)
-	entered, release := make(chan struct{}), make(chan struct{})
-	policy := sessionPolicy{policy: testPolicy, idle: time.Minute, maxAge: workerLifetime, start: testWorkerFactory(t, "cat >/dev/null\nexit 0"), history: h.append, notify: func(ctx context.Context, r Request) error {
-		close(entered)
-		select {
-		case <-release:
-			return nil
-		case <-ctx.Done():
-			return ctx.Err()
-		}
-	}}
+	dir := t.TempDir()
+	entered, release := filepath.Join(dir, "entered"), filepath.Join(dir, "release")
+	defer os.WriteFile(release, nil, 0600)
+	script := fmt.Sprintf("printf started > %q\nwhile [ ! -e %q ]; do sleep 0.01; done\ncat >/dev/null\nexit 0", entered, release)
+	policy := sessionPolicy{policy: testPolicy, idle: time.Minute, maxAge: workerLifetime, start: testWorkerFactory(t, script), history: h.append}
 	socket := testSession(t, policy)
 	done := make(chan Response, 1)
 	go func() { r := readRequest(); r.Timeout = 3; done <- sessionCall(t, socket, r) }()
-	<-entered
+	awaitSessionCondition(t, func() bool { _, err := os.Stat(entered); return err == nil })
 	r := readRequest()
 	r.Timeout = 1
 	response := sessionCall(t, socket, r)
-	close(release)
+	if err := os.WriteFile(release, nil, 0600); err != nil {
+		t.Fatal(err)
+	}
 	<-done
 	if !response.NotStarted {
 		t.Fatal("queued request started")
@@ -225,7 +224,7 @@ func TestHistoryQueuedCancellation(t *testing.T) {
 	for _, e := range records {
 		if e.Outcome == "not_started" {
 			found = true
-			if e.NotificationAccepted || e.Reason != "queued_cancelled" {
+			if e.Reason != "queued_cancelled" {
 				t.Fatalf("bad queued outcome: %+v", e)
 			}
 		}

@@ -8,16 +8,24 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"sync/atomic"
 	"testing"
 	"time"
 )
 
 func testSessionPolicy(w *worker, idle time.Duration) sessionPolicy {
 	return sessionPolicy{policy: testPolicy, idle: idle, maxAge: workerLifetime,
-		start:  func() (*worker, error) { return w, nil },
-		notify: func(context.Context, Request) error { return nil },
+		start: func() (*worker, error) { return w, nil },
 	}
+}
+
+func shortSocket(t *testing.T) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("/tmp", "opb-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	return filepath.Join(dir, "s")
 }
 
 func testWorkerFactory(t *testing.T, script string) func() (*worker, error) {
@@ -37,7 +45,7 @@ func testWorkerFactory(t *testing.T, script string) func() (*worker, error) {
 
 func testSession(t *testing.T, policy sessionPolicy) string {
 	t.Helper()
-	socket := filepath.Join(t.TempDir(), "socket")
+	socket := shortSocket(t)
 	listener, err := net.Listen("unix", socket)
 	if err != nil {
 		t.Fatal(err)
@@ -102,10 +110,8 @@ func awaitSessionCondition(t *testing.T, condition func() bool) {
 }
 
 func TestSessionRotatesUnderContinuousUse(t *testing.T) {
-	var notifications atomic.Int32
-	socket := testSession(t, sessionPolicy{policy: testPolicy, idle: 200 * time.Millisecond, maxAge: 350 * time.Millisecond,
-		start:  testWorkerFactory(t, "echo $PPID\n"),
-		notify: func(context.Context, Request) error { notifications.Add(1); return nil },
+	socket := testSession(t, sessionPolicy{policy: testPolicy, idle: time.Second, maxAge: 350 * time.Millisecond,
+		start: testWorkerFactory(t, "echo $PPID\n"),
 	})
 	first := sessionCall(t, socket, readRequest())
 	if first.Exit != 0 {
@@ -124,7 +130,7 @@ func TestSessionRotatesUnderContinuousUse(t *testing.T) {
 			rotated = true
 		}
 	}
-	if !same || !rotated || notifications.Load() != 11 {
+	if !same || !rotated {
 		t.Fatal("continuous activity failed to reuse then rotate the terminal worker")
 	}
 	status := sessionStatus(t, socket)
@@ -139,11 +145,8 @@ func TestExpiryPreservesActiveWriteAndQueuedDeadlines(t *testing.T) {
 	dir := t.TempDir()
 	release, calls := filepath.Join(dir, "release"), filepath.Join(dir, "calls")
 	defer os.WriteFile(release, nil, 0600)
-	var notifications atomic.Int32
 	start := testWorkerFactory(t, fmt.Sprintf("echo $PPID >> %q\nwhile [ ! -e %q ]; do sleep 0.01; done\ncat >/dev/null\necho $PPID\n", calls, release))
-	socket := testSession(t, sessionPolicy{policy: testPolicy, idle: 200 * time.Millisecond, maxAge: 300 * time.Millisecond, start: start,
-		notify: func(context.Context, Request) error { notifications.Add(1); return nil },
-	})
+	socket := testSession(t, sessionPolicy{policy: testPolicy, idle: 200 * time.Millisecond, maxAge: 300 * time.Millisecond, start: start})
 	active := make(chan Response, 1)
 	go func() { active <- sessionCall(t, socket, writeRequest()) }()
 	awaitSessionCondition(t, func() bool { _, err := os.Stat(calls); return err == nil })
@@ -155,7 +158,7 @@ func TestExpiryPreservesActiveWriteAndQueuedDeadlines(t *testing.T) {
 	queued := make(chan Response, 1)
 	go func() { queued <- sessionCall(t, socket, readRequest()) }()
 	awaitSessionCondition(t, func() bool { return sessionStatus(t, socket)["pending"] == float64(3) })
-	// A disconnected queued request must never notify or execute.
+	// A disconnected queued request must never execute.
 	disconnected, err := net.Dial("unix", socket)
 	if err != nil {
 		t.Fatal(err)
@@ -167,9 +170,6 @@ func TestExpiryPreservesActiveWriteAndQueuedDeadlines(t *testing.T) {
 	response := <-expired
 	if !response.NotStarted || response.Exit == 0 {
 		t.Fatalf("queued deadline not preserved: %+v", response)
-	}
-	if notifications.Load() != 1 {
-		t.Fatal("queued requests emitted notifications")
 	}
 	status := sessionStatus(t, socket)
 	if status["reuse_remaining_seconds"] != float64(0) {
@@ -191,14 +191,14 @@ func TestExpiryPreservesActiveWriteAndQueuedDeadlines(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(strings.Fields(string(data))) != 2 || notifications.Load() != 2 {
-		t.Fatal("unexpected replay or queued notification")
+	if len(strings.Fields(string(data))) != 2 {
+		t.Fatal("unexpected replay or queued execution")
 	}
 }
 
 func TestStatusDoesNotKeepIdleSessionAlive(t *testing.T) {
 	w := testWorker(t, "echo ready\n")
-	listener, err := net.Listen("unix", filepath.Join(t.TempDir(), "socket"))
+	listener, err := net.Listen("unix", shortSocket(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -221,9 +221,9 @@ func TestStatusDoesNotKeepIdleSessionAlive(t *testing.T) {
 	}
 }
 
-func TestNotificationFailureNotStartedAcrossTransport(t *testing.T) {
+func TestNotStartedAcrossTransport(t *testing.T) {
 	r := writeRequest()
-	message := notStarted("desktop notification unavailable; operation not started")
+	message := notStarted("operation not started")
 	data, err := json.Marshal(message)
 	if err != nil {
 		t.Fatal(err)
@@ -241,18 +241,18 @@ func TestNotificationFailureNotStartedAcrossTransport(t *testing.T) {
 func TestWorkerReplacementFailureDoesNotReplay(t *testing.T) {
 	var starts int
 	factory := testWorkerFactory(t, "echo ready\n")
+	initial, err := factory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	initial.started = time.Now().Add(-time.Second)
 	socket := testSession(t, sessionPolicy{policy: testPolicy, idle: time.Minute, maxAge: 100 * time.Millisecond,
 		start: func() (*worker, error) {
 			starts++
-			if starts > 1 {
-				return nil, fmt.Errorf("fake restart failure")
+			if starts == 1 {
+				return initial, nil
 			}
-			return factory()
-		},
-		notify: func(context.Context, Request) error {
-			// Cross the lifetime during notification delivery, before dispatch.
-			time.Sleep(150 * time.Millisecond)
-			return nil
+			return nil, fmt.Errorf("fake restart failure")
 		},
 	})
 	r := sessionCall(t, socket, writeRequest())

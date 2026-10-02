@@ -3,11 +3,13 @@ package secrets
 import (
 	"encoding/json"
 	"fmt"
+	"html"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"golang.org/x/sys/unix"
 )
@@ -16,33 +18,62 @@ const historyWarning = "op-bridge: access history could not be written or mainta
 
 // This deliberately contains only allowlisted metadata, never native output.
 type historyEvent struct {
-	Time                 time.Time `json:"time"`
-	ID                   string    `json:"request_id"`
-	Event                string    `json:"event"`
-	Operation            string    `json:"operation"`
-	DryRun               bool      `json:"dry_run"`
-	Vault                string    `json:"vault,omitempty"`
-	Item                 string    `json:"item,omitempty"`
-	NotificationAccepted bool      `json:"notification_accepted"`
-	Outcome              string    `json:"outcome,omitempty"`
-	Reason               string    `json:"reason,omitempty"`
-	Exit                 *int      `json:"exit,omitempty"`
+	Time      time.Time `json:"time"`
+	ID        string    `json:"request_id"`
+	Event     string    `json:"event"`
+	Operation string    `json:"operation"`
+	DryRun    bool      `json:"dry_run"`
+	Vault     string    `json:"vault,omitempty"`
+	Item      string    `json:"item,omitempty"`
+	Outcome   string    `json:"outcome,omitempty"`
+	Reason    string    `json:"reason,omitempty"`
+	Exit      *int      `json:"exit,omitempty"`
 }
 
 func (p Policy) requestHistory(r Request, id string) historyEvent {
-	// Reuse the notification allowlist and identifier sanitization exactly.
-	body, _ := p.notificationBody(r)
-	lines := strings.Split(body, "\n")
-	e := historyEvent{ID: id, Event: "request", Operation: strings.TrimSuffix(lines[0], " (dry run)"), DryRun: strings.HasSuffix(lines[0], " (dry run)")}
-	for _, line := range lines[1:] {
-		if v, ok := strings.CutPrefix(line, "Vault: "); ok {
-			e.Vault = v
-		}
-		if v, ok := strings.CutPrefix(line, "Item: "); ok {
-			e.Item = v
+	e := historyEvent{ID: id, Event: "request"}
+	args, err := p.Validate(r)
+	if err != nil || (r.Action != "read" && r.Action != "write") {
+		return e
+	}
+	n := 2
+	e.Operation = strings.Join(args[:2], " ")
+	if args[0] == "read" {
+		n = 1
+		e.Operation = "read"
+	}
+	var item string
+	for _, arg := range args[n:] {
+		if value, ok := strings.CutPrefix(arg, "--vault="); ok {
+			e.Vault = historyIdentifier(value)
+		} else if arg == "--dry-run" {
+			e.DryRun = true
+		} else if !strings.HasPrefix(arg, "-") {
+			item = arg
 		}
 	}
+	if args[0] == "read" {
+		parts := strings.SplitN(strings.TrimPrefix(item, "op://"), "/", 3)
+		e.Vault, e.Item = historyIdentifier(parts[0]), historyIdentifier(parts[1])
+	} else {
+		e.Item = historyIdentifier(item)
+	}
 	return e
+}
+
+func historyIdentifier(s string) string {
+	runes := make([]rune, 0, 160)
+	for _, r := range s {
+		if unicode.IsControl(r) || unicode.Is(unicode.Cf, r) {
+			continue
+		}
+		if len(runes) == 160 {
+			runes = append(runes, '…')
+			break
+		}
+		runes = append(runes, r)
+	}
+	return html.EscapeString(string(runes))
 }
 
 type accessHistory struct {

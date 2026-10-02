@@ -1,3 +1,5 @@
 /dist/
 /work/
 /coverage.out
+/deploy/ansible/inventory.local.yml
+/deploy/ansible/*.retry
