@@ -43,6 +43,13 @@
       changed_when: false
       register: op_bridge_login
 
+    - name: Read the login account UID
+      ansible.builtin.command: /usr/bin/id -u
+      become: false
+      check_mode: false
+      changed_when: false
+      register: op_bridge_login_uid
+
     - name: Read the target hostname
       ansible.builtin.command: /bin/hostname
       become: false
@@ -440,6 +447,9 @@
         - name: Check for an active on-demand phone session
           ansible.builtin.command: /usr/bin/systemctl --user is-active op-bridge-phone.service
           become: false
+          environment:
+            XDG_RUNTIME_DIR: "/run/user/{{ op_bridge_login_uid.stdout }}"
+            DBUS_SESSION_BUS_ADDRESS: "unix:path=/run/user/{{ op_bridge_login_uid.stdout }}/bus"
           changed_when: false
           register: op_bridge_phone_session
           failed_when: op_bridge_phone_session.rc not in [0, 3, 4]

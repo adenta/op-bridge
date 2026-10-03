@@ -541,6 +541,7 @@ func phoneDispatch(ctx context.Context, c Config, d Desktop, r Request) Response
 		// The shared startup lock prevents concurrent callers from launching duplicates.
 		conn, err = connectStartedSession(ctx, path, func(startCtx context.Context) error {
 			cmd := exec.CommandContext(startCtx, "/usr/bin/systemd-run", "--user", "--quiet", "--collect", "--unit="+phoneUnit, "--property=Restart=no", "--property=UMask=0077", "--property=KillMode=control-group", "--property=TimeoutStopSec=3s", InstalledBinary, "_phone")
+			cmd.Env = append(os.Environ(), fmt.Sprintf("XDG_RUNTIME_DIR=/run/user/%d", os.Geteuid()), fmt.Sprintf("DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/%d/bus", os.Geteuid()))
 			cmd.Stdout = io.Discard
 			cmd.Stderr = io.Discard
 			return cmd.Run()
