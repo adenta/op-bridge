@@ -437,6 +437,20 @@
             - op_bridge_old_session is not skipped
             - op_bridge_old_session.stdout.startswith('{')
 
+        - name: Check for an active on-demand phone session
+          ansible.builtin.command: /usr/bin/systemctl --user is-active op-bridge-phone.service
+          become: false
+          changed_when: false
+          register: op_bridge_phone_session
+          failed_when: op_bridge_phone_session.rc not in [0, 3, 4]
+          when: ansible_facts.system == 'Linux'
+
+        - name: Refuse replacement of an active phone session
+          ansible.builtin.assert:
+            that: op_bridge_phone_session.rc != 0
+            fail_msg: Wait for the phone session to expire or explicitly stop it before deployment.
+          when: ansible_facts.system == 'Linux'
+
         - name: Mark the matched installation ready for activation
           ansible.builtin.set_fact:
             op_bridge_activation_started: true

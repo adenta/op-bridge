@@ -88,3 +88,33 @@ These commands inspect the explicit staging file only. They do not install files
 verify file ownership or live prerequisites, start sessions, or override runtime
 policy. `config sudoers` reports that no rule is needed for client-only and
 owner-only configurations.
+
+## On-demand Remote Codex approval destination (Linux)
+
+Add one destination with `transport: "remote-codex"`, an expected account address,
+and `owner` set to the local non-root caller account (also the Remote Codex
+forwarder account). For example, on Grace:
+
+```json
+"phone": {"transport": "remote-codex", "owner": "agent", "account": "my.1password.com"}
+```
+
+Keep the current default while validating with `--desktop phone`. After a manual
+phone test, changing `default_desktop` to `phone` makes existing single-field
+callers use it. There is no automatic desktop fallback. At most one phone route
+is supported per host; cross-host submission is not supported.
+
+The first secret read starts `op-bridge-phone.service` with `systemd-run --user`,
+`Restart=no`, and `--collect`. This is not an enabled/boot service. It exposes
+0600 caller and approval sockets in `/run/user/UID/op-bridge-phone` (0700), checks
+same-UID peers, and exits after two idle minutes or ten minutes of session age
+once active requests finish. New requests after the age limit fail explicitly.
+Listing requests and checking status never launch or keep the session alive.
+Requests remain in memory and are discarded when the session ends. No desktop
+CLI worker, terminal, or native desktop authorization is started for this route.
+
+Configure the existing Remote Codex forwarder with
+`REMOTE_CODEX_APPROVAL_SOCKET=/run/user/UID/op-bridge-phone/approval.sock`.
+It authenticates the phone and relays `/remote-codex/v1/credentials` to that socket;
+it does not own requests, start sessions, or cache secrets. The execution user
+and host administrator are trusted: same-user software can access these sockets.

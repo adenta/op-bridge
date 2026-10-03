@@ -111,6 +111,21 @@ func runClient(c Config, args []string, input io.Reader, output, errorOutput io.
 	} else {
 		r.Args = args
 	}
+	if route.Transport == "remote-codex" && writeCommand(r.Args) {
+		fmt.Fprintln(errorOutput, "unsupported_operation: phone destination does not support writes; use a desktop destination")
+		return 1
+	}
+	if route.Transport == "remote-codex" {
+		if r.Timeout == 0 {
+			r.Timeout = 300
+		}
+		if r.Action == "read" {
+			if _, e := phoneRead(p, r); e != nil {
+				fmt.Fprintln(errorOutput, e)
+				return 1
+			}
+		}
+	}
 	if writeCommand(r.Args) {
 		r.Action = "write"
 		if err := readWriteInput(&r, input, p); err != nil {
@@ -130,7 +145,11 @@ func runClient(c Config, args []string, input io.Reader, output, errorOutput io.
 			fmt.Fprintln(errorOutput, err)
 			return 1
 		}
-		fmt.Fprintf(errorOutput, "Approval desktop: %s (running on %s; %s). Approve there if 1Password requests authorization.\n", route.Desktop, route.Machine, route.Transport)
+		if route.Transport == "remote-codex" {
+			fmt.Fprintf(errorOutput, "Approval destination: %s (running on %s). Open Remote Codex Settings > Credential requests to approve.\n", route.Desktop, route.Machine)
+		} else {
+			fmt.Fprintf(errorOutput, "Approval desktop: %s (running on %s; %s). Approve there if 1Password requests authorization.\n", route.Desktop, route.Machine, route.Transport)
+		}
 	} else if r.Action == "stop" {
 		fmt.Fprintf(errorOutput, "Stopping the shared secrets session on %s affects all tasks using it.\n", route.Desktop)
 	}
@@ -156,6 +175,9 @@ func runClient(c Config, args []string, input io.Reader, output, errorOutput io.
 }
 
 func dispatch(ctx context.Context, c Config, route Route, r Request) Response {
+	if route.Transport == "remote-codex" {
+		return phoneDispatch(ctx, c, c.Desktops[route.Desktop], r)
+	}
 	if route.Transport == "ssh" {
 		return external(ctx, r, "/usr/bin/ssh", sshRouteArgs(c.Desktops[route.Desktop]), "SSH route or desktop bridge failed; check the existing SSH connection and run op-bridge --desktop "+route.Desktop+" session doctor")
 	}

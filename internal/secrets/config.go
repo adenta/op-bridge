@@ -59,6 +59,7 @@ func validateConfig(c Config) error {
 		return fmt.Errorf("configure between 1 and 64 desktops")
 	}
 	localCount := 0
+	phoneCount := 0
 	for name, d := range c.Desktops {
 		if !namePattern.MatchString(name) || !validAccount(d.Account) {
 			return fmt.Errorf("invalid desktop identifier or account sign-in address")
@@ -69,13 +70,21 @@ func validateConfig(c Config) error {
 			if c.Local == nil || d.Account != c.Local.Account || d.SSHHost != "" || d.Owner != "" {
 				return fmt.Errorf("local route must match the local bridge account and omit SSH fields")
 			}
+		case "remote-codex":
+			phoneCount++
+			if !validUser(d.Owner) || d.SSHHost != "" {
+				return fmt.Errorf("remote-codex requires a local non-root owner and no SSH host")
+			}
 		case "ssh":
 			if !namePattern.MatchString(d.SSHHost) || !validUser(d.Owner) {
 				return fmt.Errorf("SSH routes require a safe SSH alias and non-root desktop owner")
 			}
 		default:
-			return fmt.Errorf("desktop transport must be local or ssh")
+			return fmt.Errorf("destination transport must be local, ssh, or remote-codex")
 		}
+	}
+	if phoneCount > 1 {
+		return fmt.Errorf("configure at most one remote-codex destination")
 	}
 	if localCount > 1 {
 		return fmt.Errorf("configure at most one local desktop route")
