@@ -1,6 +1,7 @@
 package secrets
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -15,6 +16,7 @@ import (
 	"sort"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 	"unicode/utf8"
@@ -25,21 +27,38 @@ import (
 )
 
 const phoneUnit = "op-bridge-phone.service"
-const phoneValueLimit = 64 * 1024
-const phoneWireLimit = 512 * 1024
 
 type phoneRequest struct {
 	phoneSelection
-	ID       string `json:"id"`
-	Host     string `json:"host"`
-	Caller   string `json:"caller"`
-	Deadline int64  `json:"deadline"`
-	State    string `json:"state"`
+	ID              string       `json:"id"`
+	Host            string       `json:"host"`
+	Caller          string       `json:"caller"`
+	Deadline        int64        `json:"deadline"`
+	State           string       `json:"state"`
+	Kind            string       `json:"kind,omitempty"`
+	UniqueCount     int          `json:"unique_count,omitempty"`
+	OccurrenceCount int          `json:"occurrence_count,omitempty"`
+	Fields          []phoneField `json:"fields,omitempty"`
+	Error           string       `json:"error,omitempty"`
 }
+type phoneResult struct {
+	value []byte
+	batch *completePhoneBatch
+	code  string
+}
+
+func (r phoneResult) clear() {
+	clear(r.value)
+	if r.batch != nil {
+		r.batch.clear()
+	}
+}
+
 type phoneEntry struct {
-	request phoneRequest
-	result  chan []byte
-	ctx     context.Context
+	request  phoneRequest
+	result   chan phoneResult
+	ctx      context.Context
+	finished bool
 }
 type phoneSession struct {
 	mu                sync.Mutex
@@ -79,7 +98,13 @@ func (s *phoneSession) add(ctx context.Context, selection phoneSelection) (*phon
 		}
 	}
 	deadline, _ := ctx.Deadline()
-	e := &phoneEntry{request: phoneRequest{phoneSelection: selection, ID: uuid.NewString(), Host: s.host, Caller: s.caller, Deadline: deadline.UnixMilli(), State: "pending"}, result: make(chan []byte, 1), ctx: ctx}
+	e := &phoneEntry{request: phoneRequest{phoneSelection: selection, ID: uuid.NewString(), Host: s.host, Caller: s.caller, Deadline: deadline.UnixMilli(), State: "pending"}, result: make(chan phoneResult, 1), ctx: ctx}
+	if selection.Template != nil {
+		e.request.Kind = "inject"
+		e.request.UniqueCount = len(selection.Template.fields)
+		e.request.OccurrenceCount = selection.Template.occurrences
+		e.request.Fields = append([]phoneField(nil), selection.Template.fields...)
+	}
 	s.entries[e.request.ID] = e
 	s.order = append(s.order, e.request.ID)
 	s.pending++
@@ -88,12 +113,20 @@ func (s *phoneSession) add(ctx context.Context, selection phoneSelection) (*phon
 func (s *phoneSession) finish(e *phoneEntry, state string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if e.finished {
+		return
+	}
+	e.finished = true
 	e.request.State = state
+	if e.request.Template != nil {
+		e.request.Template.clear()
+		e.request.Template = nil
+	}
 	s.pending--
 	s.timeLast = time.Now()
 	select {
 	case value := <-e.result:
-		clear(value)
+		value.clear()
 	default:
 	}
 }
@@ -108,13 +141,18 @@ func (s *phoneSession) snapshot(id string) []phoneRequest {
 	out := []phoneRequest{}
 	for key, e := range s.entries {
 		if id == key || id == "" && e.request.State == "pending" && e.ctx.Err() == nil {
-			out = append(out, e.request)
+			request := e.request
+			request.Fields = append([]phoneField(nil), request.Fields...)
+			out = append(out, request)
 		}
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Deadline < out[j].Deadline })
 	return out
 }
 func (s *phoneSession) decide(id, method, value string) string {
+	return s.decideBatch(id, method, value, nil)
+}
+func (s *phoneSession) decideBatch(id, method, value string, values []phoneBatchValue) string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	e := s.entries[id]
@@ -124,15 +162,46 @@ func (s *phoneSession) decide(id, method, value string) string {
 	if e.request.State != "pending" || e.ctx.Err() != nil {
 		return "request_not_pending"
 	}
-	if method == "release" {
+	if method == "release_batch" {
+		if e.request.Template == nil {
+			return "invalid_request"
+		}
+		batch, err := e.request.Template.complete(values)
+		if e.ctx.Err() != nil {
+			if batch != nil {
+				batch.clear()
+			}
+			return "request_not_pending"
+		}
+		if err == phoneOutputLimit {
+			e.request.State = "failed"
+			e.request.Error = "output_limit"
+			e.result <- phoneResult{code: "output_limit"}
+			return "output_limit"
+		}
+		if err != nil {
+			return "invalid_batch"
+		}
+		if e.ctx.Err() != nil {
+			batch.clear()
+			return "request_not_pending"
+		}
+		e.request.State = "releasing"
+		e.result <- phoneResult{batch: batch}
+	} else if method == "release" {
+		if e.request.Template != nil {
+			return "invalid_request"
+		}
 		if len(value) == 0 || len(value) > phoneValueLimit || !utf8.ValidString(value) {
 			return "invalid_value"
 		}
 		e.request.State = "releasing"
-		e.result <- []byte(value)
-	} else {
+		e.result <- phoneResult{value: []byte(value)}
+	} else if method == "deny" {
 		e.request.State = "denied"
-		e.result <- nil
+		e.result <- phoneResult{code: "denied"}
+	} else {
+		return "unsupported_operation"
 	}
 	return ""
 }
@@ -162,6 +231,7 @@ func (s *phoneSession) handleCaller(parent context.Context, conn net.Conn, stop 
 	if decoder.Decode(&r) != nil {
 		return
 	}
+	defer clear(r.Stdin)
 	_ = conn.SetReadDeadline(time.Time{})
 	if _, err := s.policy.Validate(r); err != nil {
 		json.NewEncoder(conn).Encode(phoneFailure("invalid_request"))
@@ -179,8 +249,15 @@ func (s *phoneSession) handleCaller(parent context.Context, conn net.Conn, stop 
 	}
 	selection, err := phoneRead(s.policy, r)
 	if err != nil {
-		json.NewEncoder(conn).Encode(phoneFailure("unsupported_operation"))
+		code := "unsupported_operation"
+		if err == unsupportedPhoneTemplate {
+			code = "unsupported_template"
+		}
+		json.NewEncoder(conn).Encode(phoneFailure(code))
 		return
+	}
+	if selection.Template != nil {
+		defer selection.Template.clear()
 	}
 	if r.Timeout == 0 {
 		r.Timeout = 300
@@ -189,6 +266,12 @@ func (s *phoneSession) handleCaller(parent context.Context, conn net.Conn, stop 
 	defer cancel()
 	closeOnCancel := context.AfterFunc(ctx, func() { conn.Close() })
 	defer closeOnCancel()
+	if selection.Template != nil && len(selection.Template.fields) == 0 {
+		if ctx.Err() == nil {
+			json.NewEncoder(conn).Encode(Response{Version: Protocol, Stdout: selection.Template.input})
+		}
+		return
+	}
 	entry, code := s.add(ctx, selection)
 	if code != "" {
 		json.NewEncoder(conn).Encode(phoneFailure(code))
@@ -218,41 +301,66 @@ func (s *phoneSession) handleCaller(parent context.Context, conn net.Conn, stop 
 		record()
 	}()
 	ack := make(chan string, 1)
+	var sending atomic.Bool
 	go func() {
 		var message struct {
 			Ack string `json:"ack"`
 		}
-		if decoder.Decode(&message) != nil {
+		if decoder.Decode(&message) != nil || !sending.Load() || message.Ack != entry.request.ID {
 			cancel()
 			return
 		}
 		ack <- message.Ack
 	}()
-	var value []byte
+	var released phoneResult
 	select {
-	case value = <-entry.result:
+	case released = <-entry.result:
 	case <-ctx.Done():
 		if parent.Err() == nil && ctx.Err() == context.DeadlineExceeded {
 			state = "expired"
 		}
 		return
 	}
-	if value == nil {
+	defer released.clear()
+	if released.code != "" {
 		state = "denied"
-		json.NewEncoder(conn).Encode(phoneFailure("denied"))
+		if released.code != "denied" {
+			state = "failed"
+		}
+		json.NewEncoder(conn).Encode(phoneFailure(released.code))
 		return
+	}
+	if ctx.Err() != nil {
+		if ctx.Err() == context.DeadlineExceeded && parent.Err() == nil {
+			state = "expired"
+		}
+		return
+	}
+	value := released.value
+	if released.batch != nil {
+		value, err = selection.Template.render(ctx, released.batch)
+		if err != nil {
+			if ctx.Err() == context.DeadlineExceeded && parent.Err() == nil {
+				state = "expired"
+			}
+			return
+		}
 	}
 	defer clear(value)
-	if ctx.Err() != nil {
-		return
-	}
-	state = "delivery_uncertain"
 	if selection.Newline {
 		value = append(value, '\n')
 	}
 	defer clear(value)
+	if ctx.Err() != nil {
+		if ctx.Err() == context.DeadlineExceeded && parent.Err() == nil {
+			state = "expired"
+		}
+		return
+	}
+	state = "delivery_uncertain"
 	_ = conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
 	response := Response{Version: Protocol, Stdout: value, RequestID: entry.request.ID}
+	sending.Store(true)
 	if json.NewEncoder(conn).Encode(response) != nil {
 		return
 	}
@@ -267,17 +375,20 @@ func (s *phoneSession) handleCaller(parent context.Context, conn net.Conn, stop 
 }
 
 type approvalMessage struct {
-	Version   int    `json:"version"`
-	ID        string `json:"id"`
-	Method    string `json:"method"`
-	RequestID string `json:"request_id,omitempty"`
-	Value     string `json:"value,omitempty"`
+	Version      int               `json:"version"`
+	ID           string            `json:"id"`
+	Method       string            `json:"method"`
+	RequestID    string            `json:"request_id,omitempty"`
+	Value        string            `json:"value,omitempty"`
+	Values       []phoneBatchValue `json:"values,omitempty"`
+	Capabilities []string          `json:"capabilities,omitempty"`
 }
 type approvalReply struct {
-	Version  int            `json:"version"`
-	ID       string         `json:"id"`
-	Requests []phoneRequest `json:"requests,omitempty"`
-	Error    string         `json:"error,omitempty"`
+	Version      int            `json:"version"`
+	ID           string         `json:"id"`
+	Requests     []phoneRequest `json:"requests,omitempty"`
+	Error        string         `json:"error,omitempty"`
+	Capabilities []string       `json:"capabilities"`
 }
 
 func (s *phoneSession) approval(w http.ResponseWriter, r *http.Request) {
@@ -297,15 +408,21 @@ func (s *phoneSession) approval(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		var msg approvalMessage
-		valid := typ == websocket.MessageText && len(data) <= phoneWireLimit && json.Unmarshal(data, &msg) == nil && msg.Version == 1 && len(msg.ID) > 0 && len(msg.ID) <= 80
+		valid := typ == websocket.MessageText && len(data) <= phoneWireLimit && decodeApprovalMessage(data, &msg) == nil && msg.Version == 1 && len(msg.ID) > 0 && len(msg.ID) <= 80
 		clear(data)
 		if !valid {
 			return
 		}
-		reply := approvalReply{Version: 1, ID: msg.ID}
+		reply := approvalReply{Version: 1, ID: msg.ID, Capabilities: []string{phoneBatchCapability}}
 		switch msg.Method {
 		case "list":
-			reply.Requests = s.snapshot("")
+			for _, request := range s.snapshot("") {
+				if request.Kind == "inject" && !hasPhoneBatchCapability(msg.Capabilities) {
+					continue
+				}
+				request.Fields = nil
+				reply.Requests = append(reply.Requests, request)
+			}
 		case "get":
 			if msg.RequestID == "" {
 				reply.Error = "invalid_request"
@@ -315,13 +432,15 @@ func (s *phoneSession) approval(w http.ResponseWriter, r *http.Request) {
 					reply.Error = "unknown_request"
 				}
 			}
-		case "release", "deny":
-			reply.Error = s.decide(msg.RequestID, msg.Method, msg.Value)
+		case "release", "release_batch", "deny":
+			reply.Error = s.decideBatch(msg.RequestID, msg.Method, msg.Value, msg.Values)
 			reply.Requests = s.snapshot(msg.RequestID)
 		default:
 			reply.Error = "unsupported_operation"
 		}
 		msg.Value = ""
+		clear(msg.Values)
+		msg.Values = nil
 		encoded, _ := json.Marshal(reply)
 		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 		err = c.Write(ctx, websocket.MessageText, encoded)
@@ -512,8 +631,21 @@ func phoneDispatch(ctx context.Context, c Config, d Desktop, r Request) Response
 		return phoneFailure("phone_owner_required")
 	}
 	if r.Action == "read" {
-		if _, err = phoneRead(Policy{Account: d.Account}, r); err != nil {
+		selection, readErr := phoneRead(Policy{Account: d.Account}, r)
+		if readErr != nil {
+			if readErr == unsupportedPhoneTemplate {
+				return phoneFailure("unsupported_template")
+			}
 			return phoneFailure("unsupported_operation")
+		}
+		if selection.Template != nil {
+			defer selection.Template.clear()
+			if len(selection.Template.fields) == 0 {
+				if ctx.Err() != nil {
+					return phoneFailure("cancelled")
+				}
+				return Response{Version: Protocol, Stdout: bytes.Clone(selection.Template.input)}
+			}
 		}
 	} else if r.Action != "status" && r.Action != "stop" && r.Action != "doctor" {
 		return phoneFailure("unsupported_operation")
@@ -564,15 +696,26 @@ func exchangePhone(conn net.Conn, r Request) Response {
 		return phoneUncertain("phone_submission_uncertain")
 	}
 	var result Response
-	if json.NewDecoder(io.LimitReader(conn, 2*phoneValueLimit+4096)).Decode(&result) != nil {
+	decoder := json.NewDecoder(io.LimitReader(conn, MaxResponse))
+	decoder.DisallowUnknownFields()
+	if decoder.Decode(&result) != nil {
+		clear(result.Stdout)
+		clear(result.Stderr)
 		return phoneUncertain("phone_session_ended_or_timed_out")
 	}
-	if result.Version != Protocol {
+	if result.Version != Protocol || len(result.Stdout) > MaxOutput || len(result.Stderr) > MaxOutput {
+		clear(result.Stdout)
+		clear(result.Stderr)
 		return phoneUncertain("protocol_mismatch")
 	}
-	if result.Exit == 0 && result.RequestID != "" {
+	if injectCommand(r.Args) && (result.Exit != 0 || result.Error != "") {
+		clear(result.Stdout)
+	}
+	result = injectResult(r, result)
+	if result.Exit == 0 && result.Error == "" && result.RequestID != "" {
 		if json.NewEncoder(conn).Encode(map[string]string{"ack": result.RequestID}) != nil {
 			clear(result.Stdout)
+			clear(result.Stderr)
 			return phoneUncertain("delivery_uncertain")
 		}
 	}

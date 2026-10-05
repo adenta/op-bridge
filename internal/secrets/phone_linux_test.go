@@ -218,7 +218,11 @@ func TestPhoneApprovalWebSocketProtocol(t *testing.T) {
 	}
 	defer c.CloseNow()
 	for _, method := range []string{"list", "release", "get", "release"} {
-		msg, _ := json.Marshal(approvalMessage{Version: 1, ID: method, Method: method, RequestID: e.request.ID, Value: "FAKE_VALUE"})
+		message := approvalMessage{Version: 1, ID: method, Method: method, RequestID: e.request.ID}
+		if method == "release" {
+			message.Value = "FAKE_VALUE"
+		}
+		msg, _ := json.Marshal(message)
 		if err = c.Write(ctx, websocket.MessageText, msg); err != nil {
 			t.Fatal(err)
 		}

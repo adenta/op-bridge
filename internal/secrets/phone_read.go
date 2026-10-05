@@ -7,22 +7,29 @@ import (
 )
 
 type phoneSelection struct {
-	Account string `json:"account"`
-	Vault   string `json:"vault"`
-	Item    string `json:"item"`
-	Field   string `json:"field"`
-	Newline bool   `json:"-"`
+	Account  string         `json:"account"`
+	Vault    string         `json:"vault"`
+	Item     string         `json:"item"`
+	Field    string         `json:"field"`
+	Newline  bool           `json:"-"`
+	Template *phoneTemplate `json:"-"`
 }
 
 // Phone reads are manually selected values, never verified native CLI lookups.
 func phoneRead(p Policy, r Request) (phoneSelection, error) {
 	out := phoneSelection{Account: p.Account, Newline: true}
-	unsupported := fmt.Errorf("unsupported_operation: phone destination supports only a single plain-text field; use a desktop destination")
+	unsupported := fmt.Errorf("unsupported_operation: phone destination supports plain-text field reads and supported inject templates; use a desktop destination")
 	if r.Action != "read" {
 		return out, unsupported
 	}
 	args, err := p.Validate(r)
 	if err != nil {
+		return out, err
+	}
+	if len(args) > 0 && args[0] == "inject" {
+		template, err := parsePhoneTemplate(r.Stdin)
+		out.Newline = false
+		out.Template = template
 		return out, err
 	}
 	n := 1

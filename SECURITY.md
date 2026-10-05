@@ -22,6 +22,23 @@ history, and neither templates nor resolved values are logged or persisted by
 the helper. Native stderr may contain secrets, as with other commands. The bridge
 does not escape output for destination formats or execute rendered text.
 
+Phone inject uses an explicitly supported template subset and manually selected
+values, not verified native CLI lookups. The phone cannot replace the template,
+change the pinned account, or add/remove requested references. A complete batch
+must contain every request-local field ID exactly once before any rendering.
+Repeated references share a selection; selected values are never reinterpreted
+as templates. Malformed or incomplete releases retain no values. Limits, expiry,
+cancellation, and concurrent release/deny decisions are enforced by the backend,
+independently of Android. Well-formed incorrectly selected values cannot be
+detected; the user must match the requested account/item/field.
+
+The phone transport retains authenticated WSS, protected windows, transient
+secret fields, no saved secret state, and no automatic mutation replay. Refresh
+only checks status. Caller acknowledgment confirms complete-response receipt,
+not downstream consumption; interrupted transmission can be uncertain. Templates,
+references, selected values, and output are excluded from inject history and
+operational logs. The same-UID/host-administrator trust boundary still applies.
+
 SSH uses existing identities, `BatchMode=yes`, strict host-key checking, and a
 fixed remote bridge command. Only strictly validated configuration values enter
 that command; request data uses stdin. The local socket is private to the desktop

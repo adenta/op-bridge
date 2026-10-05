@@ -119,12 +119,6 @@ func runClient(c Config, args []string, input io.Reader, output, errorOutput io.
 		if r.Timeout == 0 {
 			r.Timeout = 300
 		}
-		if r.Action == "read" {
-			if _, e := phoneRead(p, r); e != nil {
-				fmt.Fprintln(errorOutput, e)
-				return 1
-			}
-		}
 	}
 	if writeCommand(r.Args) {
 		r.Action = "write"
@@ -133,6 +127,17 @@ func runClient(c Config, args []string, input io.Reader, output, errorOutput io.
 		if err := readWriteInput(&r, input, p); err != nil {
 			fmt.Fprintln(errorOutput, err)
 			return 1
+		}
+	}
+	defer clear(r.Stdin)
+	if route.Transport == "remote-codex" && r.Action == "read" {
+		selection, e := phoneRead(p, r)
+		if e != nil {
+			fmt.Fprintln(errorOutput, e)
+			return 1
+		}
+		if selection.Template != nil {
+			selection.Template.clear()
 		}
 	}
 	argv, err := p.Validate(r)
@@ -157,6 +162,11 @@ func runClient(c Config, args []string, input io.Reader, output, errorOutput io.
 	}
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
 	defer cancel()
+	if route.Transport == "remote-codex" {
+		var end context.CancelFunc
+		ctx, end = context.WithTimeout(ctx, timeoutFor(r))
+		defer end()
+	}
 	result := injectResult(r, send(ctx, c, route, r))
 	if result.Version != Protocol {
 		fmt.Fprintf(errorOutput, "Desktop %s: protocol mismatch; update both hosts\n", route.Desktop)
