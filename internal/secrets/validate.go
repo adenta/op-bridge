@@ -32,7 +32,9 @@ type Response struct {
 	Exit    int    `json:"exit"`
 	Error   string `json:"error,omitempty"`
 	// Set only when the operation is known not to have reached the native CLI.
-	NotStarted bool `json:"not_started,omitempty"`
+	NotStarted bool   `json:"not_started,omitempty"`
+	ErrorCode  string `json:"error_code,omitempty"`
+	RequestID  string `json:"request_id,omitempty"`
 }
 
 func failure(message string) Response { return Response{Version: Protocol, Exit: 1, Error: message} }

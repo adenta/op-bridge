@@ -187,3 +187,37 @@ helper is inactive. Updates preserve history.
 # Run as the approval desktop owner; metadata can identify private items.
 jq . ~/.local/state/op-bridge/history/YYYY-MM-DD.jsonl
 ```
+
+## Phone approval through Remote Codex
+
+```sh
+op-bridge --desktop phone read 'op://Vault/Item/password'
+op-bridge --desktop phone --timeout 300 item get ITEM --vault VAULT --fields password --reveal
+op-bridge --desktop phone session status
+op-bridge --desktop phone session stop
+```
+
+Manually open **Remote Codex → Settings → Credential requests**, select the
+request, choose the matching item with 1Password Autofill, and tap **Release once**
+or **Deny**. There are no notifications or background phone connection.
+The caller waits up to five minutes by default (explicit timeout: 1–300 seconds).
+Cancellation disconnects the request. The destination returns the chosen value,
+not a verified native lookup: its requested account/vault/item/field is guidance
+that the user must match. “Always Allow” does not authorize release.
+
+Supported: `read op://vault/item/[section/]field` with newline options, and
+`item get ITEM --fields FIELD` with one plain-text field, optional vault,
+`--reveal`, and human-readable format. Phone references reject query/fragment
+modifiers, percent encoding, empty path segments, and control characters.
+Listing, full-item JSON, writes, multiple-field output, and `--otp` are rejected
+as `unsupported_operation` before startup. Use an explicit desktop override for
+those operations; failures never trigger automatic fallback.
+
+Release is accepted at most once per request. Receipt means op-bridge received
+the value, not that a downstream application used it. On an uncertain result,
+refresh on the phone only checks status; it never replays a value. Start a fresh
+caller request and approve again if needed. Session restart loses all status.
+No result can be retrieved later. Values are bounded to 64 KiB; at most 16 reads
+can wait. Metadata-only completion records are bounded to 128 and live only for
+the session lifetime. Existing private access history records outcomes without
+values or field paths. Diagnostic errors never include secret data.

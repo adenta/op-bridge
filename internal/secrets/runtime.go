@@ -145,6 +145,13 @@ func Main(args []string, input io.Reader, output, errorOutput io.Writer) int {
 		fmt.Fprintln(errorOutput, err)
 		return 1
 	}
+	if len(args) == 1 && args[0] == "_phone" {
+		if err := runPhone(c); err != nil {
+			fmt.Fprintln(errorOutput, "phone session failed")
+			return 1
+		}
+		return 0
+	}
 	if len(args) == 1 && strings.HasPrefix(args[0], "_") {
 		u, e := owner(c)
 		if e != nil || c.Local == nil || strconv.Itoa(os.Geteuid()) != u.Uid {

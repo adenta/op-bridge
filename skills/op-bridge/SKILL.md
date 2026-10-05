@@ -122,3 +122,13 @@ Logging failures warn without blocking access. There is no history CLI.
 Only `vault list`, `item list`, `item get`, `read`, `inject`, `item create`, and `item edit`
 are supported. No deletion, document transfer, `exec`, `run`, or environment
 injection. See `op-bridge --help` and the installed documentation for details.
+
+## Remote Codex phone destination
+
+A configured `remote-codex` transport uses the same read commands but waits for
+manual approval in Remote Codex Settings → Credential requests. Default timeout
+is five minutes. The owner manually matches the requested item in Autofill;
+account and item identity cannot be verified on this route. Single-field reads
+only; `unsupported_operation` requires an explicit desktop route for listing,
+full-item JSON, writes, or generated OTP. Never automatically fall back or replay
+an uncertain delivery. Status/doctor do not start or keep the session alive.
