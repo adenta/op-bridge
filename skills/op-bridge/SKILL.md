@@ -57,7 +57,8 @@ Stdout is returned only on complete success; failure, timeout, cancellation, and
 output-limit errors release no partial stdout. Native stderr can contain secrets.
 The 64 KiB encoded request limit includes the template; each output stream is
 bounded to 16 MiB. Update both hosts first; older desktops reject `inject` despite
-the unchanged wire protocol version 2. Phone support is separate follow-up work.
+the unchanged wire protocol version 2. Phone routes support the subset described
+below through grouped manual selection.
 
 ## Create or edit
 
@@ -129,6 +130,20 @@ A configured `remote-codex` transport uses the same read commands but waits for
 manual approval in Remote Codex Settings → Credential requests. Default timeout
 is five minutes. The owner manually matches the requested item in Autofill;
 account and item identity cannot be verified on this route. Single-field reads
-only; `unsupported_operation` requires an explicit desktop route for listing,
-full-item JSON, writes, or generated OTP. Never automatically fall back or replay
-an uncertain delivery. Status/doctor do not start or keep the session alive.
+and grouped `inject` are supported; `unsupported_operation` requires an explicit
+desktop route for listing, multi-field `item get`, full-item JSON, writes, or
+generated OTP. Never automatically fall back or replay an uncertain delivery.
+Status/doctor do not start or keep the session alive.
+
+Phone `inject` accepts literal UTF-8 text and `{{ op://Vault/Item/field }}` or
+`{{ op://Vault/Item/section/field }}` references. Environment expressions,
+query/fragment modifiers, percent encoding, and malformed placeholders are
+rejected before approval; use a desktop route for other native syntax. Identical
+paths share one selection. On the phone choose every requested field (or select
+**Use empty value** explicitly), then tap **Release all once**. The backend
+accepts only a complete batch, performs literal substitution without escaping
+or added newlines, and returns no partial result on failure. Templates stay off
+Android. Both the updated backend and an Android client advertising
+`inject_batch_v1` are required. A supported template with no references returns
+unchanged without starting a phone session. See the usage reference for the full
+supported subset and limits.

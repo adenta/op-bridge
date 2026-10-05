@@ -50,8 +50,8 @@ deletion, documents, attachments, shell execution, native file options, `exec`,
 
 ## Bulk retrieval
 
-`inject` resolves several secret references using one bridge request and one
-native `op inject` invocation in the shared terminal worker:
+On desktop routes, `inject` resolves several secret references using one bridge
+request and one native `op inject` invocation in the shared terminal worker:
 
 ```sh
 op-bridge --desktop mac --timeout 180 inject <<'EOF'
@@ -84,7 +84,7 @@ rendered output is logged, cached, or saved by the helper.
 
 Update both client and approval desktop before using `inject`. The wire protocol
 remains version 2, but older desktops reject this new allowlisted command. Phone
-approval support is separate follow-up work.
+routes support the explicit subset documented below, using manual selections.
 
 ## Safe writes
 
@@ -176,8 +176,8 @@ reaching the session are excluded. History is convenient metadata, not a
 tamper-proof audit trail. Logging/cleanup failures warn without changing the
 secret operation's exit status.
 
-`inject` records only operation and outcome metadata; templates are not parsed
-for vault, item, or field identifiers.
+`inject` records only operation and outcome metadata. Neither desktop nor phone
+inject history stores templates or vault, item, or field references.
 
 Files dated more than 90 days before the current UTC date are removed at session
 startup and on the next logged event after a date change. Cleanup waits while the
@@ -193,6 +193,7 @@ jq . ~/.local/state/op-bridge/history/YYYY-MM-DD.jsonl
 ```sh
 op-bridge --desktop phone read 'op://Vault/Item/password'
 op-bridge --desktop phone --timeout 300 item get ITEM --vault VAULT --fields password --reveal
+op-bridge --desktop phone inject < secrets.template
 op-bridge --desktop phone session status
 op-bridge --desktop phone session stop
 ```
@@ -209,15 +210,42 @@ Supported: `read op://vault/item/[section/]field` with newline options, and
 `item get ITEM --fields FIELD` with one plain-text field, optional vault,
 `--reveal`, and human-readable format. Phone references reject query/fragment
 modifiers, percent encoding, empty path segments, and control characters.
-Listing, full-item JSON, writes, multiple-field output, and `--otp` are rejected
+Listing, full-item JSON, writes, multi-field `item get`, and `--otp` are rejected
 as `unsupported_operation` before startup. Use an explicit desktop override for
 those operations; failures never trigger automatic fallback.
+
+Phone `inject` parses literal UTF-8 text plus `{{ op://Vault/Item/field }}` and
+`{{ op://Vault/Item/section/field }}`. ASCII whitespace immediately inside braces
+is allowed; names can contain internal spaces and Unicode. Path components must
+be nonempty without leading/trailing whitespace, query/fragment/attribute syntax,
+percent encoding, backslash, `$`, braces, control characters, or format characters.
+Invalid UTF-8, NUL, malformed or nested double braces, extra path segments, and
+environment expressions (`$NAME`, `${NAME}`) are rejected as
+`unsupported_template` before any approval or output. Ordinary dollar signs and
+single braces remain literal. Use a desktop route for other native syntax.
+
+The phone shows one grouped request. Identical reference paths share a selection;
+case and name/ID aliases are not normalized. Choose each requested field, or use
+**Use empty value** explicitly, then tap **Release all once**. All values travel
+in one atomic release. The backend checks the complete set before rendering and
+returns no partial result. Selected values are not reparsed; substitution adds
+no newline and performs no escaping. Templates stay off Android. A supported
+template with no references, including empty input, returns unchanged without
+approval or starting a session. Both the updated phone backend and an Android
+client advertising `inject_batch_v1` are required for grouped selection; older
+clients continue to see only single-field requests.
 
 Release is accepted at most once per request. Receipt means op-bridge received
 the value, not that a downstream application used it. On an uncertain result,
 refresh on the phone only checks status; it never replays a value. Start a fresh
 caller request and approve again if needed. Session restart loses all status.
-No result can be retrieved later. Values are bounded to 64 KiB; at most 16 reads
+No result can be retrieved later. Values are bounded to 64 KiB each; the whole
+approval message is bounded to 512 KiB including JSON escaping. Caller requests
+remain bounded to 64 KiB encoded and rendered output to 16 MiB. A single timeout
+covers startup through receipt. At most 16 reads
 can wait. Metadata-only completion records are bounded to 128 and live only for
 the session lifetime. Existing private access history records outcomes without
-values or field paths. Diagnostic errors never include secret data.
+values or field paths. Inject history also excludes vault/item references and
+templates. Incomplete batches retain no values; output-limit failures release no
+stdout. After transmission begins, interruption is delivery uncertainty, not
+proof that no bytes arrived. Diagnostic errors never include secret data.
