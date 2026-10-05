@@ -105,6 +105,9 @@ func cancelOnDisconnect(input io.Reader, cancel context.CancelFunc) {
 func readWriteInput(r *Request, input io.Reader, p Policy) error {
 	data, err := io.ReadAll(io.LimitReader(input, MaxRequest+1))
 	if err != nil {
+		if injectCommand(r.Args) {
+			return fmt.Errorf("could not read template input")
+		}
 		return fmt.Errorf("could not read JSON input")
 	}
 	r.Stdin = data
@@ -129,6 +132,7 @@ func timeoutFor(r Request) time.Duration {
 func Main(args []string, input io.Reader, output, errorOutput io.Writer) int {
 	if len(args) == 0 || (len(args) == 1 && (args[0] == "--help" || args[0] == "-h")) {
 		fmt.Fprintln(output, "Usage: op-bridge [--desktop NAME] [--timeout SECONDS] vault list|item list|item get ITEM|read REFERENCE [op options]\n       op-bridge [--desktop NAME] [--timeout SECONDS] item create - [--vault VAULT] [--format FORMAT] [--dry-run] < item.json\n       op-bridge [--desktop NAME] [--timeout SECONDS] item edit ITEM [--vault VAULT] [--format FORMAT] [--dry-run] < item.json\n       op-bridge [--desktop NAME] session status|doctor|stop\n       op-bridge [--desktop NAME] route show [--format=json]\nWrites require JSON on stdin; no file options or attachments. Linux or macOS arm64 with a configured 1Password approval desktop. Overrides apply to this invocation. Session stop affects all tasks on the selected desktop. Output can contain secrets.")
+		fmt.Fprintln(output, "       op-bridge [--desktop NAME] [--timeout SECONDS] inject < template\nInject resolves native {{ op://Vault/Item/field }} references from stdin. No file options; stdout is returned only on success.")
 		fmt.Fprintln(output, "Sessions expire after 2 idle minutes; terminal approval reuse is capped at 10 minutes, allowing active operations to finish. Status reports session limits; doctor checks desktop prerequisites.")
 		fmt.Fprintln(output, "Setup: op-bridge config check|sudoers FILE (inspect staging policy only). Version: op-bridge --version.")
 		return 0
@@ -398,7 +402,12 @@ func runWorker(input io.Reader, output io.Writer, op string, env []string, p Pol
 		mu.Unlock()
 		go func() {
 			defer work.Done()
-			response := uncertainWrite(r, execute(ctx, op, args, env, r.Stdin))
+			input := r.Stdin
+			if injectCommand(r.Args) && input == nil {
+				// An empty template is omitted by JSON but still needs piped stdin.
+				input = []byte{}
+			}
+			response := injectResult(r, uncertainWrite(r, execute(ctx, op, args, env, input)))
 			stop()
 			mu.Lock()
 			defer mu.Unlock()

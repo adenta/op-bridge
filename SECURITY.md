@@ -15,6 +15,13 @@ The native executable is fixed at `/usr/bin/op` on Linux and
 The child environment is rebuilt, with caching disabled and no inherited
 service-account tokens.
 
+Bulk `inject` is a read operation using stdin templates and stdout only. Native
+file flags are rejected. The existing encoded request and output bounds apply;
+failed operations release no rendered stdout. Templates are not parsed for access
+history, and neither templates nor resolved values are logged or persisted by
+the helper. Native stderr may contain secrets, as with other commands. The bridge
+does not escape output for destination formats or execute rendered text.
+
 SSH uses existing identities, `BatchMode=yes`, strict host-key checking, and a
 fixed remote bridge command. Only strictly validated configuration values enter
 that command; request data uses stdin. The local socket is private to the desktop

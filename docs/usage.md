@@ -8,6 +8,7 @@ op-bridge item list --vault VAULT --format=json
 op-bridge item get ITEM_ID --vault VAULT --fields password
 op-bridge read 'op://Vault/Item/field'
 op-bridge --desktop office --timeout 180 read 'op://Vault/Item/field'
+op-bridge inject < secrets.template
 op-bridge item create --vault VAULT - < item.json
 op-bridge item edit ITEM_ID --vault VAULT < updated.json
 op-bridge route show --format=json
@@ -39,12 +40,51 @@ to authorize.
 | `item list` | `--format`, `--vault`, `--tags`, `--categories`, `--favorite`, `--include-archive`, `--long` |
 | `item get ITEM` | `--vault`, `--fields`, `--format`, `--reveal`, `--otp`, `--include-archive` |
 | `read REFERENCE` | `--no-newline` or `-n` |
+| `inject` | None; template on stdin, rendered output on stdout |
 | `item create -`, `item edit ITEM` | `--vault`, `--format`, `--dry-run` |
 
 Formats are `json` and `human-readable`. All operations accept an explicit
 `--account` only when it matches the configured account. Unknown commands/options,
 deletion, documents, attachments, shell execution, native file options, `exec`,
 `run`, and environment injection are rejected.
+
+## Bulk retrieval
+
+`inject` resolves several secret references using one bridge request and one
+native `op inject` invocation in the shared terminal worker:
+
+```sh
+op-bridge --desktop mac --timeout 180 inject <<'EOF'
+REGISTRY_PASSWORD={{ op://Personal/Registry/password }}
+DATABASE_PASSWORD={{ op://Production/Database/password }}
+EOF
+```
+
+Use native `{{ op://Vault/Item/field }}` template syntax. The bridge forwards the
+template without parsing or rewriting it; native 1Password resolves references
+under the pinned account. Caller environment variables are not forwarded. There
+is no custom escaping: callers must handle the destination's JSON, shell,
+dotenv, or other format requirements. Do not evaluate rendered output as shell
+code. Repeated references, literal text, multiline content, and empty templates
+are passed through to native 1Password.
+
+Templates are accepted only on stdin. Input redirection reads files on the
+caller's machine; `--in-file`, `--out-file`, positional filenames, and other
+native options are rejected (the matching pinned `--account` remains allowed).
+The client reads and validates the complete input before opening transport and
+provides it to the native CLI through an OS pipe. The existing 64 KiB encoded
+request limit includes the template; output streams remain limited to 16 MiB
+each. One request timeout covers the whole operation, including queuing.
+
+Stdout is buffered and returned only if the entire operation succeeds. A native
+failure, timeout, cancellation, or output-limit failure returns no stdout, even
+if the CLI emitted a partial result. Native stderr and nonzero exit status follow
+the existing command behavior; stderr can contain secrets. No template or
+rendered output is logged, cached, or saved by the helper.
+
+Update both client and approval desktop before using `inject`. The wire protocol
+remains version 2, but older desktops reject this new allowlisted command. Phone
+approval support is separate follow-up work.
 
 ## Safe writes
 
@@ -66,7 +106,8 @@ response, the result can be unknown even if the CLI made the change. Inspect the
 item before considering another write. Protocol responses carry `not_started`
 only when execution is known not to have begun.
 
-Native stdout, stderr, and exit status are preserved; the helper adds route and
+Except for discarding failed `inject` stdout, native stdout, stderr, and exit
+status are preserved; the helper adds route and
 failure diagnostics on stderr. Native output can itself contain secrets. Wrapper
 transport errors never include request input, environment, or secret references.
 
@@ -134,6 +175,9 @@ success or of no effects. Invalid requests, control commands, and failures befor
 reaching the session are excluded. History is convenient metadata, not a
 tamper-proof audit trail. Logging/cleanup failures warn without changing the
 secret operation's exit status.
+
+`inject` records only operation and outcome metadata; templates are not parsed
+for vault, item, or field identifiers.
 
 Files dated more than 90 days before the current UTC date are removed at session
 startup and on the next logged event after a date change. Cleanup waits while the

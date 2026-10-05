@@ -37,6 +37,28 @@ Do not attempt to switch accounts. Native 1Password may request approval; tell t
 user to approve on the destination identified by the command. Requests default to
 120 seconds; global `--timeout SECONDS` permits 1 to 300 seconds.
 
+## Retrieve several values
+
+Use native `inject` to resolve several references in one bridge request and one
+native CLI invocation. Send the rendered output directly to its consumer:
+
+```sh
+op-bridge --desktop NAME inject <<'EOF'
+REGISTRY_PASSWORD={{ op://Personal/Registry/password }}
+DATABASE_PASSWORD={{ op://Production/Database/password }}
+EOF
+```
+
+Templates must enter on stdin; file flags and positional filenames are rejected.
+Use native template syntax. The helper adds no escaping for JSON, shell, dotenv,
+or other destination formats, and does not forward the caller's environment.
+Never evaluate rendered output as shell code or print values into task logs.
+Stdout is returned only on complete success; failure, timeout, cancellation, and
+output-limit errors release no partial stdout. Native stderr can contain secrets.
+The 64 KiB encoded request limit includes the template; each output stream is
+bounded to 16 MiB. Update both hosts first; older desktops reject `inject` despite
+the unchanged wire protocol version 2. Phone support is separate follow-up work.
+
 ## Create or edit
 
 Use writes only when the task calls for storing or changing an item. Supply a
@@ -97,6 +119,6 @@ request or `unknown` outcome does not prove that nothing happened. Records exclu
 values, templates, native output, field paths, task identity, and created item IDs.
 Logging failures warn without blocking access. There is no history CLI.
 
-Only `vault list`, `item list`, `item get`, `read`, `item create`, and `item edit`
+Only `vault list`, `item list`, `item get`, `read`, `inject`, `item create`, and `item edit`
 are supported. No deletion, document transfer, `exec`, `run`, or environment
 injection. See `op-bridge --help` and the installed documentation for details.

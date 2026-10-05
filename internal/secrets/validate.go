@@ -47,6 +47,18 @@ func writeCommand(args []string) bool {
 	return len(args) >= 2 && args[0] == "item" && (args[1] == "create" || args[1] == "edit")
 }
 
+func injectCommand(args []string) bool {
+	return len(args) > 0 && args[0] == "inject"
+}
+
+// Never release a partially rendered template after a failed operation.
+func injectResult(r Request, result Response) Response {
+	if injectCommand(r.Args) && (result.Exit != 0 || result.Error != "") {
+		result.Stdout = nil
+	}
+	return result
+}
+
 // Keep errors free of template contents. Native op validates the item schema.
 func validateTemplate(input []byte) error {
 	var item map[string]any
@@ -112,7 +124,7 @@ func (p Policy) Validate(r Request) ([]string, error) {
 		}
 		return nil, fmt.Errorf("unsupported request")
 	}
-	if (r.Action == "write") != writeCommand(r.Args) || (r.Action == "read" && len(r.Stdin) != 0) {
+	if (r.Action == "write") != writeCommand(r.Args) || (r.Action == "read" && len(r.Stdin) != 0 && !injectCommand(r.Args)) {
 		return nil, fmt.Errorf("command and request action do not match")
 	}
 	if r.Action == "write" {
@@ -130,8 +142,8 @@ func (p Policy) Validate(r Request) ([]string, error) {
 	}
 	n := 2
 	var operation string
-	if r.Args[0] == "read" {
-		operation, n = "read", 1
+	if r.Args[0] == "read" || injectCommand(r.Args) {
+		operation, n = r.Args[0], 1
 	} else if len(r.Args) >= 2 {
 		operation = strings.Join(r.Args[:2], " ")
 	}
@@ -139,6 +151,9 @@ func (p Policy) Validate(r Request) ([]string, error) {
 	switches := map[string]bool{}
 	want := 0
 	switch operation {
+	case "inject":
+		// Only stdin/stdout are permitted; native file and environment options
+		// must never cross the desktop boundary.
 	case "read":
 		want = 1
 		switches["--no-newline"] = true
@@ -166,7 +181,7 @@ func (p Policy) Validate(r Request) ([]string, error) {
 		values["--format"] = true
 		switches["--dry-run"] = true
 	default:
-		return nil, fmt.Errorf("supported commands: vault list, item list, item get, item create, item edit, read")
+		return nil, fmt.Errorf("supported commands: vault list, item list, item get, item create, item edit, read, inject")
 	}
 	values["--account"] = true
 	flags, positional := []string{}, []string{}

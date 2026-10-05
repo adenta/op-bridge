@@ -113,6 +113,8 @@ func runClient(c Config, args []string, input io.Reader, output, errorOutput io.
 	}
 	if writeCommand(r.Args) {
 		r.Action = "write"
+	}
+	if r.Action == "write" || injectCommand(r.Args) {
 		if err := readWriteInput(&r, input, p); err != nil {
 			fmt.Fprintln(errorOutput, err)
 			return 1
@@ -136,7 +138,7 @@ func runClient(c Config, args []string, input io.Reader, output, errorOutput io.
 	}
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
 	defer cancel()
-	result := send(ctx, c, route, r)
+	result := injectResult(r, send(ctx, c, route, r))
 	if result.Version != Protocol {
 		fmt.Fprintf(errorOutput, "Desktop %s: protocol mismatch; update both hosts\n", route.Desktop)
 		return 1

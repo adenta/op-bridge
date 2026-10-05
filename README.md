@@ -8,6 +8,7 @@ reading, creating, and editing 1Password items. It works without Codex or an age
 op-bridge route show
 op-bridge vault list --format=json
 op-bridge read 'op://Vault/Item/password'
+op-bridge inject < secrets.template
 op-bridge --desktop office --timeout 180 item get ITEM_ID --fields password
 op-bridge item create --vault VAULT - < item.json
 op-bridge item edit ITEM_ID --vault VAULT < updated.json
@@ -15,6 +16,11 @@ op-bridge item edit ITEM_ID --vault VAULT < updated.json
 
 Output can contain secrets. Request only the needed field and pass it directly to
 the process that needs it. Do not put values in logs, shell arguments, or source files.
+
+For bulk retrieval, `inject` resolves native `{{ op://Vault/Item/field }}`
+references in a stdin template through one bridge request and one native CLI
+invocation. Rendered stdout is returned only when the entire operation succeeds.
+See the [bulk retrieval reference](docs/usage.md#bulk-retrieval).
 
 ## How it works
 

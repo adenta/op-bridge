@@ -200,7 +200,7 @@ func TestLateCancellationCannotAffectNextRequest(t *testing.T) {
 func TestExternalKeepsRequestPipeOpen(t *testing.T) {
 	path, _ := os.Executable()
 	t.Setenv("SECRETS_TEST_PIPE", "1")
-	for _, request := range []Request{readRequest(), writeRequest()} {
+	for _, request := range []Request{readRequest(), writeRequest(), injectRequest("{{ op://Vault/Item/field }}")} {
 		r := external(context.Background(), request, path, []string{"-test.run=^TestBridgePipeProcess$"}, "bridge failed")
 		if r.Exit != 0 {
 			t.Fatal(r.Error)

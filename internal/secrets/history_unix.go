@@ -37,11 +37,10 @@ func (p Policy) requestHistory(r Request, id string) historyEvent {
 		return e
 	}
 	n := 2
-	e.Operation = strings.Join(args[:2], " ")
-	if args[0] == "read" {
+	if args[0] == "read" || args[0] == "inject" {
 		n = 1
-		e.Operation = "read"
 	}
+	e.Operation = strings.Join(args[:n], " ")
 	var item string
 	for _, arg := range args[n:] {
 		if value, ok := strings.CutPrefix(arg, "--vault="); ok {

@@ -100,6 +100,7 @@ func TestClientRoutingAllOperationsAndFailures(t *testing.T) {
 		action, input string
 	}{
 		{[]string{"read", "op://Vault/Item/field"}, "read", ""},
+		{[]string{"inject"}, "read", "{{ op://Vault/Item/field }}"},
 		{[]string{"vault", "list"}, "read", ""},
 		{[]string{"item", "list"}, "read", ""},
 		{[]string{"item", "get", "example"}, "read", ""},
